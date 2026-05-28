@@ -218,6 +218,12 @@ class TrainingConfig(BaseModel):
             "save_total_limit": None,
             "logging_steps": 10,
             "report_to": [],
+            # Memory savers — without these, full-param 3B in bf16 OOMs on A10G
+            # (22 GB) at default settings. Gradient checkpointing trades ~30%
+            # throughput for a ~5x cut in activation memory, which is the
+            # difference between fitting and not on a single 24 GB-class GPU.
+            "gradient_checkpointing": True,
+            "gradient_checkpointing_kwargs": {"use_reentrant": False},
         }
         kwargs.update(self.extra_args)
         return kwargs
