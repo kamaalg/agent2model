@@ -3,12 +3,19 @@
 The canonical user journey is ``compile`` → ``generate`` → ``train`` →
 ``eval``/``serve``. Each command prints the expected LLM cost before running and
 the actual cost after, and exits with an actionable message on typed failures.
+
+A ``cloud`` subcommand group wraps the generic Modal entrypoint:
+``subterranean cloud run my_workflow.yaml --size 3b`` simply ``subprocess``-
+invokes ``modal run -m subterranean.cloud.modal_app::run -- ...`` with the
+typed flags mapped through, so users don't have to remember the ``modal run
+-m`` incantation.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -43,6 +50,14 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+cloud_app = typer.Typer(
+    name="cloud",
+    help="Run the pipeline on Modal (generic + paper reproductions).",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(cloud_app, name="cloud")
 
 
 @app.callback()
@@ -392,6 +407,293 @@ def serve(
     except ServingError as exc:
         logger.error(str(exc))
         raise typer.Exit(code=1) from exc
+
+
+#: Default modal-run target for ``subterranean cloud run``. The ``::run`` suffix
+#: selects the generic ``@app.local_entrypoint`` in ``modal_app.py``.
+MODAL_RUN_TARGET = "subterranean.cloud.modal_app::run"
+
+
+def _build_modal_run_argv(
+    flowchart_path: Path,
+    *,
+    name: str | None,
+    size: str,
+    n: int,
+    epochs: int,
+    eval_n: int,
+    base_model: str | None,
+    skip_eval: bool,
+    serve_after: bool,
+    yes: bool = False,
+    modal_bin: str = "modal",
+) -> list[str]:
+    """Build the argv to invoke the generic Modal entrypoint via ``modal run -m``.
+
+    Pure helper kept separate so unit tests can assert on the constructed command
+    without spawning Modal. Mirrors :func:`subterranean.cloud.modal_app.run`'s
+    parameters one-for-one, dasherising them for the ``modal run`` CLI.
+
+    Args:
+        flowchart_path: Path to the flowchart (resolved by the caller).
+        name: Optional recipe name override.
+        size: Training size preset (``"3b"`` / ``"8b"``).
+        n: Number of conversations.
+        epochs: Training epochs.
+        eval_n: Eval scenarios per condition.
+        base_model: Optional HF base model override.
+        skip_eval: If True, append ``--skip-eval``.
+        serve_after: If True, append ``--serve-after``.
+        yes: If True, append ``--yes`` to skip the modal entrypoint's
+            cost-confirmation prompt (required for non-interactive use).
+        modal_bin: The ``modal`` executable path (default ``"modal"``).
+
+    Returns:
+        The argv list to hand to :mod:`subprocess`.
+
+    Example:
+        >>> _build_modal_run_argv(Path("/tmp/wf.yaml"), name=None, size="3b",
+        ...     n=2000, epochs=20, eval_n=200, base_model=None,
+        ...     skip_eval=False, serve_after=False)
+        ['modal', 'run', '-m', 'subterranean.cloud.modal_app::run', '--',
+         '--flowchart-path', '/tmp/wf.yaml', '--size', '3b',
+         '--n', '2000', '--epochs', '20', '--eval-n', '200']
+    """
+    argv: list[str] = [
+        modal_bin,
+        "run",
+        "-m",
+        MODAL_RUN_TARGET,
+        "--",
+        "--flowchart-path",
+        str(flowchart_path),
+        "--size",
+        size,
+        "--n",
+        str(n),
+        "--epochs",
+        str(epochs),
+        "--eval-n",
+        str(eval_n),
+    ]
+    if name is not None:
+        argv += ["--name", name]
+    if base_model is not None:
+        argv += ["--base-model", base_model]
+    if skip_eval:
+        argv.append("--skip-eval")
+    if serve_after:
+        argv.append("--serve-after")
+    if yes:
+        argv.append("--yes")
+    return argv
+
+
+@cloud_app.command("run")
+def cloud_run(
+    flowchart_path: Annotated[
+        Path, typer.Argument(help="Flowchart YAML, or a .py file defining a LangGraph graph.")
+    ],
+    name: Annotated[
+        str | None,
+        typer.Option(
+            "--name",
+            help="Recipe name (volume subdir). Defaults to the YAML's name or the file stem.",
+        ),
+    ] = None,
+    size: Annotated[str, typer.Option("--size", help="Training preset: '3b' or '8b'.")] = "3b",
+    n: Annotated[int, typer.Option("--n", help="Number of conversations to generate.")] = 2000,
+    epochs: Annotated[int, typer.Option("--epochs", help="Training epochs.")] = 20,
+    eval_n: Annotated[
+        int, typer.Option("--eval-n", help="Scenarios per evaluation condition.")
+    ] = 200,
+    base_model: Annotated[
+        str | None,
+        typer.Option(
+            "--base-model",
+            help="HF base model id. Defaults to the size preset's model.",
+        ),
+    ] = None,
+    skip_eval: Annotated[
+        bool,
+        typer.Option("--skip-eval/--no-skip-eval", help="Skip the evaluation step."),
+    ] = False,
+    serve_after: Annotated[
+        bool,
+        typer.Option(
+            "--serve-after/--no-serve-after",
+            help="Launch the autoscaling serve endpoint after training.",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes/--no-yes",
+            "-y",
+            help="Skip the cost-confirmation prompt on the Modal entrypoint (use for CI).",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Print the modal-run command that would be invoked and exit.",
+        ),
+    ] = False,
+) -> None:
+    """Run the generic Modal pipeline on a user-supplied flowchart.
+
+    Builds and invokes ``modal run -m subterranean.cloud.modal_app::run -- ...``
+    in a subprocess, mapping the typed flags through. Modal must be installed
+    (``pip install subterranean-agents[cloud]``) and authenticated.
+
+    Args:
+        flowchart_path: Path to a ``.yaml`` / ``.yml`` flowchart or LangGraph
+            ``.py``.
+        name: Recipe name; defaults to the YAML's ``name`` field or file stem.
+        size: ``"3b"`` (single GPU) or ``"8b"`` (8x A100 ZeRO-3).
+        n: Number of conversations to generate.
+        epochs: Training epochs.
+        eval_n: Scenarios per evaluation condition.
+        base_model: HF base model id; defaults to the size preset.
+        skip_eval: Skip the evaluation step.
+        serve_after: Launch the autoscaling serve endpoint after training.
+        yes: Pass ``--yes`` through to the Modal entrypoint so it skips the
+            interactive cost-confirmation prompt. Required for non-interactive
+            invocations.
+        dry_run: Print the constructed command and exit without running it.
+    """
+    resolved = flowchart_path.expanduser().resolve()
+    if not resolved.exists():
+        logger.error(f"No such flowchart: {resolved}")
+        raise typer.Exit(code=1)
+
+    argv = _build_modal_run_argv(
+        resolved,
+        name=name,
+        size=size,
+        n=n,
+        epochs=epochs,
+        eval_n=eval_n,
+        base_model=base_model,
+        skip_eval=skip_eval,
+        serve_after=serve_after,
+        yes=yes,
+    )
+
+    rendered = " ".join(argv)
+    if dry_run:
+        typer.echo(rendered)
+        return
+
+    logger.info(f"Launching: {rendered}")
+    try:
+        result = subprocess.run(argv, check=False)
+    except FileNotFoundError as exc:
+        logger.error(
+            "Could not find the `modal` executable on PATH. Install the cloud "
+            "extra (`pip install subterranean-agents[cloud]`) and run `modal setup`."
+        )
+        raise typer.Exit(code=1) from exc
+    if result.returncode != 0:
+        raise typer.Exit(code=result.returncode)
+
+
+@cloud_app.command("doctor")
+def cloud_doctor() -> None:
+    """Run the cloud-preflight checklist and print a green/red summary.
+
+    Validates, in order: ``modal`` is installed; the local Modal token exists;
+    the ``anthropic-secret`` Modal Secret resolves; the local
+    ``ANTHROPIC_API_KEY`` bills (informational); a Hugging Face token is valid
+    if one is configured (informational). Exits with code 0 when every critical
+    check passes, 1 otherwise. Informational red lines never flip the code.
+    """
+    from rich.console import Console
+
+    from subterranean.cloud.doctor import overall_exit_code, run_all_checks
+
+    console = Console()
+    results = run_all_checks()
+    console.print("[bold]subterranean cloud doctor[/bold]")
+    for r in results:
+        mark = "[green]+[/green]" if r.ok else "[red]x[/red]"
+        sev = "" if r.severity == "critical" else " [dim](info)[/dim]"
+        console.print(f"  {mark} {r.name}{sev}: {r.message}")
+        if not r.ok and r.fix_command:
+            console.print(f"      [dim]fix:[/dim] {r.fix_command}")
+    code = overall_exit_code(results)
+    if code == 0:
+        console.print("[green]All critical checks passed.[/green]")
+    else:
+        console.print("[red]One or more critical checks failed; see fixes above.[/red]")
+    raise typer.Exit(code=code)
+
+
+class _TyperWizardIO:
+    """:class:`WizardIO` implementation that delegates to Typer prompts."""
+
+    def confirm(self, prompt: str, *, default: bool = False) -> bool:
+        """Yes/no prompt via :func:`typer.confirm`."""
+        return bool(typer.confirm(prompt, default=default))
+
+    def prompt_hidden(self, prompt: str) -> str:
+        """Hidden-input prompt via :func:`typer.prompt`."""
+        return str(typer.prompt(prompt, hide_input=True))
+
+    def echo(self, message: str) -> None:
+        """Forward a one-line status message to stdout."""
+        typer.echo(message)
+
+
+@cloud_app.command("setup")
+def cloud_setup() -> None:
+    """First-time cloud wizard: account check, Modal token, Anthropic Secret.
+
+    Idempotent — every step inspects current state and only acts when something
+    is missing. After the steps complete, runs the doctor checklist as a final
+    summary. Designed so a user can re-run it at any time without breaking
+    anything.
+    """
+    from rich.console import Console
+
+    from subterranean.cloud.setup import run_setup
+
+    console = Console()
+    console.print("[bold]subterranean cloud setup[/bold]")
+    io = _TyperWizardIO()
+    results = run_setup(io)
+    for r in results:
+        marker = {
+            "already_done": "[green]+[/green]",
+            "completed": "[green]+[/green]",
+            "skipped": "[yellow]-[/yellow]",
+            "user_declined": "[yellow]-[/yellow]",
+            "failed": "[red]x[/red]",
+        }[r.outcome]
+        console.print(f"  {marker} {r.step}: {r.message}")
+
+    console.print(
+        "\nSetup complete. Running `subterranean cloud doctor` to verify your environment.\n"
+    )
+    # Reuse the same doctor command so output stays in lock-step.
+    from subterranean.cloud.doctor import overall_exit_code, run_all_checks
+
+    doctor_results = run_all_checks()
+    for check in doctor_results:
+        mark = "[green]+[/green]" if check.ok else "[red]x[/red]"
+        sev = "" if check.severity == "critical" else " [dim](info)[/dim]"
+        console.print(f"  {mark} {check.name}{sev}: {check.message}")
+        if not check.ok and check.fix_command:
+            console.print(f"      [dim]fix:[/dim] {check.fix_command}")
+
+    if overall_exit_code(doctor_results) == 0:
+        console.print("\n[green]Ready.[/green] Try: subterranean cloud run my_workflow.yaml")
+    else:
+        console.print(
+            "\n[yellow]Some checks still failing.[/yellow] Address them above and re-run "
+            "`subterranean cloud setup` or `subterranean cloud doctor`."
+        )
 
 
 if __name__ == "__main__":

@@ -18,9 +18,12 @@ import pytest
 
 from subterranean.cloud import _recipes
 from subterranean.cloud._recipes import (
+    DEFAULT_BASE_FOR_SIZE,
     EXAMPLES,
     GPU_3B,
     GPU_8B,
+    ExampleRecipe,
+    Recipe,
     build_training_config,
     get_recipe,
     gpu_for_size,
@@ -39,10 +42,13 @@ RUNPOD_DIR = Path(_recipes.__file__).parent / "runpod"
 
 
 def test_core_imports_without_modal() -> None:
-    # modal is not installed here; these must import regardless.
+    # The core and cloud packages must import even when modal is absent. Here we
+    # only assert the import contract holds (modal may or may not be installed
+    # depending on the host); the modal-free guarantee is independently covered
+    # by ``test_cloud_init_does_not_import_modal_app`` and
+    # ``test_recipes_module_has_no_modal_dependency``.
     assert importlib.import_module("subterranean") is not None
     assert importlib.import_module("subterranean.cloud") is not None
-    assert importlib.util.find_spec("modal") is None
 
 
 def test_cloud_init_does_not_import_modal_app() -> None:
@@ -228,5 +234,212 @@ def test_modal_app_importable_where_modal_present() -> None:
     assert modal_app.APP_NAME == "subterranean"
     for fn in ("generate_data", "train_3b", "train_8b", "evaluate", "serve"):
         assert hasattr(modal_app, fn)
-    for ep in ("reproduce_travel", "reproduce_zoom", "reproduce_insurance"):
+    for ep in ("reproduce_travel", "reproduce_zoom", "reproduce_insurance", "run"):
         assert hasattr(modal_app, ep)
+
+
+def test_modal_app_exposes_build_recipe_helper() -> None:
+    pytest.importorskip("modal")
+    from subterranean.cloud import modal_app
+
+    assert callable(modal_app.build_recipe_from_path)
+
+
+# --------------------------------------------------------------------------- #
+# New Recipe shape (carries flowchart_yaml inline)                              #
+# --------------------------------------------------------------------------- #
+
+
+_MINIMAL_YAML = (
+    "name: tiny\nstart: greet\nnodes:\n"
+    "  greet:\n    role: agent\n    prompt: hi\n    next: [end]\n"
+    "  end:\n    terminal: success\n"
+)
+
+
+def test_recipe_class_replaces_example_recipe_alias() -> None:
+    # Backward-compat alias must point at the same class.
+    assert ExampleRecipe is Recipe
+
+
+def test_recipe_requires_flowchart_yaml() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Recipe(  # type: ignore[call-arg]
+            name="x",
+            size="3b",
+            base_model="Qwen/Qwen2.5-3B-Instruct",
+            n_convos=10,
+            epochs=1,
+        )
+
+
+def test_recipe_round_trips_through_model_dump() -> None:
+    r = Recipe(
+        name="x",
+        flowchart_yaml=_MINIMAL_YAML,
+        size="3b",
+        base_model="Qwen/Qwen2.5-3B-Instruct",
+        n_convos=10,
+        epochs=1,
+    )
+    blob = r.model_dump()
+    again = Recipe.model_validate(blob)
+    assert again == r
+    assert again.flowchart_yaml == _MINIMAL_YAML
+
+
+def test_default_base_for_size_table() -> None:
+    assert DEFAULT_BASE_FOR_SIZE["3b"] == "Qwen/Qwen2.5-3B-Instruct"
+    assert DEFAULT_BASE_FOR_SIZE["8b"] == "Qwen/Qwen3-8B"
+
+
+# --------------------------------------------------------------------------- #
+# Paper EXAMPLES carry their YAML inline and still build the right config      #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("example_id", ["travel", "zoom", "insurance"])
+def test_example_recipe_has_inline_flowchart_yaml(example_id: str) -> None:
+    recipe = get_recipe(example_id)
+    assert isinstance(recipe.flowchart_yaml, str)
+    assert recipe.flowchart_yaml.strip()
+    import yaml as _yaml
+
+    parsed = _yaml.safe_load(recipe.flowchart_yaml)
+    assert isinstance(parsed, dict)
+    assert "name" in parsed and "start" in parsed and "nodes" in parsed
+
+
+# --------------------------------------------------------------------------- #
+# LangGraph → YAML helper round-trip                                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_flowchart_to_yaml_text_round_trips() -> None:
+    pytest.importorskip("langgraph")
+    import yaml as _yaml
+
+    from subterranean.adapters.langgraph import flowchart_to_yaml_text
+    from subterranean.ir.schema import Flowchart
+
+    source = Flowchart.model_validate(_yaml.safe_load(_MINIMAL_YAML))
+    text = flowchart_to_yaml_text(source)
+    again = Flowchart.model_validate(_yaml.safe_load(text))
+    assert again.name == source.name
+    assert again.start == source.start
+    assert set(again.nodes) == set(source.nodes)
+
+
+def test_langgraph_to_yaml_text_produces_validatable_flowchart(tmp_path: Path) -> None:
+    pytest.importorskip("langgraph")
+    import yaml as _yaml
+
+    from subterranean.adapters.langgraph import langgraph_to_yaml_text
+    from subterranean.ir.schema import Flowchart
+    from subterranean.ir.validator import validate
+
+    src = tmp_path / "g.py"
+    src.write_text(
+        "from typing import TypedDict\n"
+        "from langgraph.graph import StateGraph, START, END\n"
+        "class S(TypedDict):\n    x: int\n"
+        "def _node(s: S) -> S:\n    return s\n"
+        "def build_graph():\n"
+        "    g = StateGraph(S)\n"
+        "    g.add_node('greet', _node)\n"
+        "    g.add_edge(START, 'greet')\n"
+        "    g.add_edge('greet', END)\n"
+        "    return g\n",
+        encoding="utf-8",
+    )
+
+    text = langgraph_to_yaml_text(src)
+    fc = Flowchart.model_validate(_yaml.safe_load(text))
+    validate(fc)
+    assert fc.start == "greet"
+
+
+# --------------------------------------------------------------------------- #
+# build_recipe_from_path: the pure helper the `run` entrypoint dispatches to   #
+# --------------------------------------------------------------------------- #
+
+
+def test_build_recipe_from_path_reads_yaml(tmp_path: Path) -> None:
+    pytest.importorskip("modal")
+    from subterranean.cloud.modal_app import build_recipe_from_path
+
+    yaml_path = tmp_path / "wf.yaml"
+    yaml_path.write_text(_MINIMAL_YAML, encoding="utf-8")
+    recipe = build_recipe_from_path(yaml_path, size="3b", n=42, epochs=3)
+    # Class identity check is brittle because earlier tests reload the
+    # _recipes module; compare by qualified name instead.
+    assert type(recipe).__qualname__ == "Recipe"
+    assert recipe.name == "tiny"  # picked up from YAML's `name` field
+    assert recipe.size == "3b"
+    assert recipe.n_convos == 42
+    assert recipe.epochs == 3
+    assert recipe.base_model == DEFAULT_BASE_FOR_SIZE["3b"]
+    assert recipe.flowchart_yaml == _MINIMAL_YAML
+
+
+def test_build_recipe_from_path_name_override(tmp_path: Path) -> None:
+    pytest.importorskip("modal")
+    from subterranean.cloud.modal_app import build_recipe_from_path
+
+    yaml_path = tmp_path / "wf.yaml"
+    yaml_path.write_text(_MINIMAL_YAML, encoding="utf-8")
+    recipe = build_recipe_from_path(yaml_path, name="custom", size="8b")
+    assert recipe.name == "custom"
+    assert recipe.size == "8b"
+    assert recipe.base_model == DEFAULT_BASE_FOR_SIZE["8b"]
+
+
+def test_build_recipe_from_path_rejects_unknown_suffix(tmp_path: Path) -> None:
+    pytest.importorskip("modal")
+    from subterranean.cloud.modal_app import build_recipe_from_path
+
+    bogus = tmp_path / "wf.txt"
+    bogus.write_text("oops", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported flowchart suffix"):
+        build_recipe_from_path(bogus)
+
+
+def test_build_recipe_from_path_rejects_unknown_size(tmp_path: Path) -> None:
+    pytest.importorskip("modal")
+    from subterranean.cloud.modal_app import build_recipe_from_path
+
+    yaml_path = tmp_path / "wf.yaml"
+    yaml_path.write_text(_MINIMAL_YAML, encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported size"):
+        build_recipe_from_path(yaml_path, size="70b")
+
+
+def test_build_recipe_from_path_handles_langgraph_pyfile(tmp_path: Path) -> None:
+    pytest.importorskip("modal")
+    pytest.importorskip("langgraph")
+    from subterranean.cloud.modal_app import build_recipe_from_path
+
+    src = tmp_path / "lg.py"
+    src.write_text(
+        "from typing import TypedDict\n"
+        "from langgraph.graph import StateGraph, START, END\n"
+        "class S(TypedDict):\n    x: int\n"
+        "def _n(s: S) -> S:\n    return s\n"
+        "def build_graph():\n"
+        "    g = StateGraph(S)\n"
+        "    g.add_node('greet', _n)\n"
+        "    g.add_edge(START, 'greet')\n"
+        "    g.add_edge('greet', END)\n"
+        "    return g\n",
+        encoding="utf-8",
+    )
+    recipe = build_recipe_from_path(src, size="3b")
+    assert recipe.size == "3b"
+    # The flowchart YAML must come back as valid YAML embedded in the recipe.
+    import yaml as _yaml
+
+    parsed = _yaml.safe_load(recipe.flowchart_yaml)
+    assert isinstance(parsed, dict)
+    assert parsed["start"] == "greet"

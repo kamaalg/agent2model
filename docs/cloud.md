@@ -4,12 +4,27 @@ Most users have no local GPU. **Modal** is the primary, one-command recipe;
 **RunPod** is the secondary, more-manual recipe. The `cloud/` module is kept
 decoupled from the core library.
 
+!!! tip "First time on Modal?"
+    Start with the [Cloud quickstart](cloud-quickstart.md). It walks you
+    through `subterranean cloud setup` (idempotent wizard) and `subterranean
+    cloud doctor` (preflight checklist) and explains the cost-confirmation
+    prompt every cloud entrypoint shows before any spend.
+
 ## Modal (primary)
 
 ```bash
 pip install "subterranean-agents[cloud]"
-modal token new            # one-time auth
-modal secret create anthropic ANTHROPIC_API_KEY=sk-ant-...   # for generate/eval
+subterranean cloud setup   # wizard: token + anthropic-secret
+subterranean cloud doctor  # green/red preflight checklist
+```
+
+Under the hood the wizard runs `modal token new` and creates the
+`anthropic-secret` Modal Secret used by `generate`/`eval`. The manual
+equivalent is still supported:
+
+```bash
+modal token new
+modal secret create anthropic-secret ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 ### The headline demo

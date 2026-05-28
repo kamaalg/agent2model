@@ -96,8 +96,12 @@ subterranean serve build/travel --port 8000
 
 ```bash
 pip install "subterranean-agents[cloud]"
+subterranean cloud setup   # one-time, idempotent
 modal run -m subterranean.cloud.modal_app::reproduce_travel
 ```
 
 This runs generate → train → eval on Modal and produces a compiled 3B model
-within 5% of the paper's Table 1. See [Cloud deployment](cloud.md).
+within 5% of the paper's Table 1. The full first-time walkthrough — wizard,
+doctor checklist, cost-confirmation prompt — lives in the
+[Cloud quickstart](cloud-quickstart.md); the per-function reference is in
+[Cloud deployment](cloud.md).

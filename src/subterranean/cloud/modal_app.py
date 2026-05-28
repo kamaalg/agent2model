@@ -1,9 +1,20 @@
-"""Modal deployment recipe for the full subterranean pipeline (Phase 7).
+"""Modal deployment recipes for the full subterranean pipeline (Phase 7).
 
-This is the primary cloud recipe: a user with **no local GPU** reproduces a paper
-experiment end to end with a single command, e.g.::
+This module exposes:
 
-    modal run -m subterranean.cloud.modal_app::reproduce_travel
+* Five **worker functions** (``generate_data``, ``train_3b``, ``train_8b``,
+  ``evaluate``, ``serve``) parameterised by a :class:`~subterranean.cloud._recipes.Recipe`
+  pydantic model. Modal cloudpickles Pydantic args fine, so the worker receives the
+  full recipe — including the flowchart YAML text inline — without needing access
+  to the caller's local filesystem.
+* A **generic** ``run`` local entrypoint that takes a path to *any* user
+  flowchart (``.yaml`` or LangGraph ``.py``) and chains generate → train → optional
+  evaluate → optional serve, persisting outputs under the recipe's name on the
+  Modal volumes.
+* Three **paper-reproduction** entrypoints (``reproduce_travel``,
+  ``reproduce_zoom``, ``reproduce_insurance``) that are thin wrappers around
+  :func:`run` using the pre-built :data:`~subterranean.cloud._recipes.EXAMPLES`
+  recipes. Kept for backward compatibility with the published paper-repro docs.
 
 Why this module requires ``modal`` to import
 ---------------------------------------------
@@ -13,7 +24,7 @@ So **this module deliberately requires ``modal``** and is not importable without
 the ``[cloud]`` extra. The rest of the package stays modal-free — ``import
 subterranean`` and ``import subterranean.cloud`` work without modal, and all the
 pure recipe logic lives in :mod:`subterranean.cloud._recipes` (no modal import),
-which is what the unit tests exercise. ``cloud/__init__.py` does **not** import
+which is what the unit tests exercise. ``cloud/__init__.py`` does **not** import
 this module, keeping the import contract intact.
 
 Layout on Modal
@@ -23,19 +34,13 @@ Layout on Modal
   image (vLLM) for the inference endpoint.
 * Two persisted volumes: ``BUILD_VOLUME`` for build artifacts (the flowchart IR,
   generated dataset, eval reports) and ``MODEL_VOLUME`` for fine-tuned weights.
+  Outputs are keyed by ``recipe.name`` — two users with the same name will
+  collide (last-write-wins is fine for v1).
 * One secret: ``anthropic-secret`` providing ``ANTHROPIC_API_KEY`` to the
   API-bound functions.
 
-Functions
----------
-* :func:`generate_data` — CPU, calls :mod:`subterranean.generation`.
-* :func:`train_3b` — single A10G/A100, the 3B path.
-* :func:`train_8b` — 8x A100 with DeepSpeed ZeRO-3, the 8B path.
-* :func:`evaluate` — CPU, API-bound, calls :mod:`subterranean.eval`.
-* :func:`serve` — autoscaling vLLM endpoint wrapping :mod:`subterranean.serve`.
-
 Entrypoints (``modal run -m subterranean.cloud.modal_app::<name>``):
-``reproduce_travel`` (3B), ``reproduce_zoom`` (8B), ``reproduce_insurance`` (8B).
+``run`` (generic), ``reproduce_travel``, ``reproduce_zoom``, ``reproduce_insurance``.
 """
 
 from __future__ import annotations
@@ -43,65 +48,95 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import modal
-
 from subterranean.cloud._recipes import (
+    DEFAULT_BASE_FOR_SIZE,
+    EXAMPLES,
     GPU_3B,
     GPU_8B,
     ExampleRecipe,
+    Recipe,
     build_training_config,
     get_recipe,
+)
+from subterranean.cloud.modal_app_constants import (
+    ANTHROPIC_SECRET,
+    APP_NAME,
+    BUILD_ROOT,
+    BUILD_VOLUME,
+    CPU_IMAGE,
+    EVALUATE_TIMEOUT,
+    GENERATE_TIMEOUT,
+    HOUR,
+    MODEL_ROOT,
+    MODEL_VOLUME,
+    SERVE_APP,
+    SERVE_IMAGE,
+    TRAIN_3B_TIMEOUT,
+    TRAIN_8B_TIMEOUT,
+    TRAIN_IMAGE,
+    VOLUMES,
 )
 
 # --------------------------------------------------------------------------- #
 # App, images, volumes, secrets                                                #
 # --------------------------------------------------------------------------- #
 
-APP_NAME = "subterranean"
-app = modal.App(APP_NAME)
+#: The Modal app. Defined in :mod:`modal_app_constants` so the serve class in
+#: :mod:`_modal_serve` registers against the same instance.
+app = SERVE_APP
 
-# The package is installed from its source tree (PyPI once published). Each image
-# pulls the extras the step needs and nothing more, keeping cold-starts lean.
-_PIP_PKG = "subterranean-agents"
+#: Backward-compat aliases preserved for downstream code/tests that imported
+#: the lower-case names from this module.
+cpu_image = CPU_IMAGE
+train_image = TRAIN_IMAGE
+serve_image = SERVE_IMAGE
+_VOLUMES = VOLUMES
+_HOUR = HOUR
 
-#: CPU image for the API-bound generate/evaluate steps (core + anthropic only).
-cpu_image = modal.Image.debian_slim(python_version="3.11").pip_install(f"{_PIP_PKG}[report]")
+# Importing this triggers the @app.cls registration; do it after the app exists
+# so the class lands on the same App instance.
+from subterranean.cloud import _modal_serve  # noqa: E402  (intentional ordering)
+from subterranean.cloud._modal_serve import ServeCls  # noqa: E402
 
-#: Training image: the heavy ML stack (torch/trl/deepspeed/bitsandbytes).
-train_image = modal.Image.debian_slim(python_version="3.11").pip_install(f"{_PIP_PKG}[train]")
-
-#: Serving image: vLLM (CUDA/Linux only).
-serve_image = modal.Image.debian_slim(python_version="3.11").pip_install(f"{_PIP_PKG}[serve]")
-
-#: Persisted build artifacts (flowchart IR, dataset.jsonl, eval reports).
-BUILD_VOLUME = modal.Volume.from_name("subterranean-build", create_if_missing=True)
-#: Persisted fine-tuned model weights.
-MODEL_VOLUME = modal.Volume.from_name("subterranean-models", create_if_missing=True)
-
-BUILD_ROOT = "/build"
-MODEL_ROOT = "/models"
-_VOLUMES = {BUILD_ROOT: BUILD_VOLUME, MODEL_ROOT: MODEL_VOLUME}
-
-#: Anthropic API key, injected into the API-bound functions.
-ANTHROPIC_SECRET = modal.Secret.from_name("anthropic-secret")
-
-# Timeouts (seconds). Generation/eval are long API-bound jobs; the 3B run is the
-# paper's ~3.5h; the 8B ZeRO-3 run is fast (~15-30 min) but gets head-room.
-_HOUR = 60 * 60
-GENERATE_TIMEOUT = 6 * _HOUR
-TRAIN_3B_TIMEOUT = 6 * _HOUR
-TRAIN_8B_TIMEOUT = 3 * _HOUR
-EVALUATE_TIMEOUT = 4 * _HOUR
+_ = _modal_serve  # silence unused-import linters; we need the side effect
 
 
-def _build_dir(example: str) -> str:
-    """Return the on-volume build directory for an example."""
-    return f"{BUILD_ROOT}/{example}"
+def _build_dir(name: str) -> str:
+    """Return the on-volume build directory for a recipe name."""
+    return f"{BUILD_ROOT}/{name}"
 
 
-def _model_dir(example: str) -> str:
-    """Return the on-volume model output directory for an example."""
-    return f"{MODEL_ROOT}/{example}"
+def _model_dir(name: str) -> str:
+    """Return the on-volume model output directory for a recipe name."""
+    return f"{MODEL_ROOT}/{name}"
+
+
+def _materialise_flowchart(recipe: Recipe) -> Path:
+    """Write the recipe's inline YAML to the build volume and return the build dir.
+
+    The worker side of the boundary: the recipe carries ``flowchart_yaml`` over
+    the wire from the caller; we persist it on the build volume so the rest of
+    the pipeline (generation, eval) can compile it the same way the local CLI
+    does. The compiled JSON IR also lands here as ``flowchart.json``.
+    """
+    import json
+
+    from subterranean.ir.loader import load_flowchart_from_string
+    from subterranean.ir.validator import validate
+
+    build = Path(_build_dir(recipe.name))
+    build.mkdir(parents=True, exist_ok=True)
+    yaml_path = build / "flowchart.yaml"
+    yaml_path.write_text(recipe.flowchart_yaml, encoding="utf-8")
+
+    flowchart = load_flowchart_from_string(recipe.flowchart_yaml)
+    validate(flowchart)
+    ir_path = build / "flowchart.json"
+    ir_path.write_text(
+        json.dumps(flowchart.model_dump(mode="json"), indent=2, sort_keys=False),
+        encoding="utf-8",
+    )
+    return build
 
 
 # --------------------------------------------------------------------------- #
@@ -120,25 +155,23 @@ def _model_dir(example: str) -> str:
     cpu=4.0,
 )
 def generate_data(
-    example: str,
+    recipe: Recipe,
     *,
-    n: int,
-    budget_usd: float,
-    model: str,
+    model: str | None = None,
     seed: int = 0,
     max_concurrent: int = 10,
 ) -> str:
     """Generate synthetic training data on a Modal CPU worker.
 
-    Reads ``<build>/flowchart.json`` from the build volume, runs the async
+    Materialises the recipe's flowchart YAML to ``<build>/flowchart.{yaml,json}``
+    on the build volume, runs the async
     :class:`~subterranean.generation.generator.ConversationGenerator`, and writes
     ``<build>/dataset.jsonl`` back to the volume. This step is API-bound (no GPU).
 
     Args:
-        example: Reproduction example name (``travel`` / ``zoom`` / ``insurance``).
-        n: Number of conversations to generate.
-        budget_usd: Hard USD cap; generation stops if exceeded.
-        model: Anthropic model id for generation.
+        recipe: The recipe to run (carries flowchart, n_convos, budget, name).
+        model: Anthropic model id for generation. Defaults to the generator's
+            default.
         seed: Base RNG seed.
         max_concurrent: Maximum in-flight API calls.
 
@@ -147,15 +180,24 @@ def generate_data(
     """
     import asyncio
 
-    from subterranean.cli import _load_compiled_flowchart
     from subterranean.generation.formatter import write_dataset
-    from subterranean.generation.generator import ConversationGenerator, GenerationConfig
+    from subterranean.generation.generator import (
+        DEFAULT_MODEL,
+        ConversationGenerator,
+        GenerationConfig,
+    )
     from subterranean.logging import logger
 
-    build = Path(_build_dir(example))
-    flowchart = _load_compiled_flowchart(build)
+    build = _materialise_flowchart(recipe)
+    from subterranean.ir.loader import load_flowchart_from_string
+
+    flowchart = load_flowchart_from_string(recipe.flowchart_yaml)
     config = GenerationConfig(
-        n=n, model=model, budget_usd=budget_usd, seed=seed, max_concurrent=max_concurrent
+        n=recipe.n_convos,
+        model=model or DEFAULT_MODEL,
+        budget_usd=recipe.gen_budget_usd,
+        seed=seed,
+        max_concurrent=max_concurrent,
     )
     generator = ConversationGenerator(flowchart, config)
     conversations = asyncio.run(generator.run(build))
@@ -167,16 +209,19 @@ def generate_data(
     return str(dataset_path)
 
 
-def _run_training(example: str) -> str:
+def _run_training(recipe: Recipe, dataset_path: str | None = None) -> str:
     """Shared body for the 3B/8B training functions.
 
-    Loads the dataset from the build volume, builds the per-example
+    Loads the dataset from the build volume (default location, or the explicit
+    ``dataset_path`` returned by :func:`generate_data`), builds the per-recipe
     :class:`~subterranean.training.config.TrainingConfig` (3B single-GPU or 8B
     ZeRO-3), trains via :func:`subterranean.training.trainer.train`, and persists
     the best checkpoint to the model volume.
 
     Args:
-        example: Reproduction example name.
+        recipe: The recipe to train against.
+        dataset_path: Optional explicit dataset path; defaults to
+            ``<build>/dataset.jsonl``.
 
     Returns:
         The path to the best checkpoint on the model volume.
@@ -184,16 +229,16 @@ def _run_training(example: str) -> str:
     from subterranean.logging import logger
     from subterranean.training.trainer import train
 
-    recipe = get_recipe(example)
-    build = Path(_build_dir(example))
-    output_dir = _model_dir(example)
+    build = Path(_build_dir(recipe.name))
+    dataset = Path(dataset_path) if dataset_path else build / "dataset.jsonl"
+    output_dir = _model_dir(recipe.name)
 
     config = build_training_config(recipe, output_dir)
     logger.info(
-        f"Training {example} ({config.size}): base={config.base_model}, "
+        f"Training {recipe.name} ({config.size}): base={config.base_model}, "
         f"epochs={config.epochs}, gpus={config.num_gpus}."
     )
-    best = train(config, build / "dataset.jsonl")
+    best = train(config, dataset)
     MODEL_VOLUME.commit()
     logger.info(f"Best checkpoint: {best.path} (eval_loss={best.eval_loss}).")
     return best.path
@@ -205,16 +250,17 @@ def _run_training(example: str) -> str:
     volumes=_VOLUMES,
     timeout=TRAIN_3B_TIMEOUT,
 )
-def train_3b(example: str) -> str:
+def train_3b(recipe: Recipe, dataset_path: str | None = None) -> str:
     """Fine-tune the 3B path on a single A10G/A100.
 
     Args:
-        example: Reproduction example name (a 3B example, e.g. ``travel``).
+        recipe: A recipe with ``size="3b"``.
+        dataset_path: Optional explicit dataset path.
 
     Returns:
         The path to the best checkpoint on the model volume.
     """
-    return _run_training(example)
+    return _run_training(recipe, dataset_path)
 
 
 @app.function(  # type: ignore[untyped-decorator]  # modal decorators are Any (see overrides)
@@ -223,7 +269,7 @@ def train_3b(example: str) -> str:
     volumes=_VOLUMES,
     timeout=TRAIN_8B_TIMEOUT,
 )
-def train_8b(example: str) -> str:
+def train_8b(recipe: Recipe, dataset_path: str | None = None) -> str:
     """Fine-tune the 8B path on 8x A100 80GB with DeepSpeed ZeRO-3.
 
     The ZeRO-3 config ships at
@@ -231,12 +277,13 @@ def train_8b(example: str) -> str:
     it through the multi-GPU :meth:`TrainingConfig.for_8b` preset.
 
     Args:
-        example: Reproduction example name (an 8B example, e.g. ``zoom``).
+        recipe: A recipe with ``size="8b"``.
+        dataset_path: Optional explicit dataset path.
 
     Returns:
         The path to the best checkpoint on the model volume.
     """
-    return _run_training(example)
+    return _run_training(recipe, dataset_path)
 
 
 @app.function(  # type: ignore[untyped-decorator]  # modal decorators are Any (see overrides)
@@ -247,10 +294,9 @@ def train_8b(example: str) -> str:
     cpu=4.0,
 )
 def evaluate(
-    example: str,
+    recipe: Recipe,
+    model_path: str | None = None,
     *,
-    n: int,
-    budget_usd: float,
     baselines: tuple[str, ...] = ("in_context",),
     served_url: str | None = None,
     judge_model: str | None = None,
@@ -259,14 +305,19 @@ def evaluate(
 ) -> dict[str, Any]:
     """Run the evaluation harness, parallel across scenarios, on a CPU worker.
 
-    Samples ``n`` scenarios, runs each condition concurrently against a
-    flowchart-blind user simulator, judges on the 5-criterion rubric, and writes
-    ``eval_report.json``/``eval_report.pdf`` to the build volume.
+    Samples ``recipe.eval_n`` scenarios, runs each condition concurrently against
+    a flowchart-blind user simulator, judges on the 5-criterion rubric, and writes
+    ``eval_report.json``/``eval_report.pdf`` to the build volume under
+    ``recipe.name``.
+
+    Note: returns the eval result synchronously (not ``.spawn()``).
 
     Args:
-        example: Reproduction example name.
-        n: Scenarios per condition.
-        budget_usd: Hard USD cap across all LLM calls.
+        recipe: The recipe being evaluated.
+        model_path: Optional path to the trained model (returned by ``train_*``).
+            Unused here directly — eval drives a served URL or baselines — but
+            accepted for symmetry with the pipeline so callers can pass it
+            through verbatim from ``train.remote``.
         baselines: Baseline condition names to evaluate against.
         served_url: OpenAI-compatible base URL of a served compiled model; when
             given, the served ``compiled`` condition is added.
@@ -279,17 +330,18 @@ def evaluate(
     """
     import asyncio
 
-    from subterranean.cli import _load_compiled_flowchart
     from subterranean.eval.baselines import make_condition
     from subterranean.eval.judge import Judge, JudgeConfig
     from subterranean.eval.report import write_json_report, write_pdf_report
     from subterranean.eval.runner import EvalConfig, EvalRunner
     from subterranean.exceptions import EvalError
     from subterranean.generation.generator import DEFAULT_MODEL
+    from subterranean.ir.loader import load_flowchart_from_string
     from subterranean.logging import logger
 
-    build = Path(_build_dir(example))
-    flowchart = _load_compiled_flowchart(build)
+    _ = model_path  # accepted for pipeline symmetry; eval consumes served_url
+    build = _materialise_flowchart(recipe)
+    flowchart = load_flowchart_from_string(recipe.flowchart_yaml)
 
     names = list(baselines)
     if served_url:
@@ -298,8 +350,8 @@ def evaluate(
 
     judge_cfg = JudgeConfig(model=judge_model or DEFAULT_MODEL)
     config = EvalConfig(
-        n=n,
-        budget_usd=budget_usd,
+        n=recipe.eval_n,
+        budget_usd=recipe.eval_budget_usd,
         seed=seed,
         max_concurrent=max_concurrent,
         judge=judge_cfg,
@@ -313,100 +365,312 @@ def evaluate(
     except EvalError as exc:  # pragma: no cover - report extra optional on Modal
         logger.warning(str(exc))
     BUILD_VOLUME.commit()
-    logger.info(f"Evaluated {example}: total cost ${result.total_cost_usd:.4f}.")
+    logger.info(f"Evaluated {recipe.name}: total cost ${result.total_cost_usd:.4f}.")
     return result.model_dump(mode="json")
 
 
-@app.function(  # type: ignore[untyped-decorator]  # modal decorators are Any (see overrides)
-    image=serve_image,
-    gpu="A100-80GB",
-    volumes=_VOLUMES,
-    timeout=_HOUR,
-    scaledown_window=300,
-    min_containers=0,
-    max_containers=4,
-)
-@modal.concurrent(max_inputs=32)  # type: ignore[untyped-decorator]
-@modal.web_server(port=8000, startup_timeout=600)  # type: ignore[untyped-decorator]
-def serve(example: str) -> None:
-    """Serve a compiled model behind an autoscaling, OpenAI-compatible vLLM endpoint.
+class _ServeProxy:
+    """Thin proxy that gives :data:`serve` a ``.remote(recipe, model_path)`` API.
 
-    Resolves the best checkpoint for ``example`` on the model volume and launches
-    vLLM's OpenAI-compatible server (``/v1/chat/completions``). Modal autoscaling
-    spins containers up on demand and down to zero after the scaledown window.
+    Mirrors the call shape of the other workers (``generate_data.remote(recipe)``,
+    ``train_3b.remote(recipe, dataset)``) so the generic ``run`` entrypoint reads
+    uniformly. Internally builds the :class:`ServeCls` Modal class with the
+    parameters set and calls the underlying nullary ``web_server``-decorated method.
+    """
+
+    @staticmethod
+    def remote(recipe: Recipe, model_path: str | None = None) -> None:
+        """Start the autoscaling serve endpoint for ``recipe``.
+
+        Args:
+            recipe: The recipe whose compiled model to serve.
+            model_path: Optional explicit checkpoint path; defaults to the
+                recipe's on-volume model directory.
+        """
+        # modal's @app.cls rewrites the class; mypy can't see modal.parameter()
+        # kw-args, so silence the call-arg check here.
+        instance = ServeCls(  # type: ignore[call-arg]
+            recipe_name=recipe.name, model_path=model_path or ""
+        )
+        instance.run.remote()
+
+    @staticmethod
+    def spawn(recipe: Recipe, model_path: str | None = None) -> None:
+        """Spawn the serve endpoint asynchronously (does not wait for startup)."""
+        instance = ServeCls(  # type: ignore[call-arg]
+            recipe_name=recipe.name, model_path=model_path or ""
+        )
+        instance.run.spawn()
+
+
+#: Module-level serve handle exposing ``serve.remote(recipe, model_path=None)``.
+serve = _ServeProxy()
+
+
+# --------------------------------------------------------------------------- #
+# Generic + reproduction entrypoints                                           #
+# --------------------------------------------------------------------------- #
+
+
+def _load_flowchart_yaml_text(path: Path) -> str:
+    """Read a flowchart spec from disk as YAML text.
+
+    A ``.py`` path is converted via the LangGraph adapter; a ``.yaml`` / ``.yml``
+    path is read verbatim. Used by the local-entrypoint side of the Modal
+    boundary — never runs on a worker.
 
     Args:
-        example: Reproduction example name whose compiled model to serve.
+        path: Local filesystem path to a ``.py`` LangGraph file or YAML
+            flowchart.
+
+    Returns:
+        The YAML text to embed in :attr:`Recipe.flowchart_yaml`.
+
+    Raises:
+        FileNotFoundError: If ``path`` does not exist.
+        ValueError: If the suffix is not ``.py``, ``.yaml``, or ``.yml``.
     """
-    from subterranean.serve import vllm_server
+    if not path.exists():
+        raise FileNotFoundError(f"No such flowchart: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".py":
+        from subterranean.adapters.langgraph import langgraph_to_yaml_text
 
-    model_path = vllm_server.resolve_model_path(_model_dir(example))
-    vllm_server.serve(model_path, port=8000, host="0.0.0.0", served_model_name=example)
+        return langgraph_to_yaml_text(path)
+    if suffix in {".yaml", ".yml"}:
+        return path.read_text(encoding="utf-8")
+    raise ValueError(f"Unsupported flowchart suffix {path.suffix!r}; expected .yaml, .yml, or .py.")
 
 
-# --------------------------------------------------------------------------- #
-# Reproduction entrypoints                                                     #
-# --------------------------------------------------------------------------- #
+def build_recipe_from_path(
+    flowchart_path: str | Path,
+    *,
+    name: str | None = None,
+    size: str = "3b",
+    n: int = 2000,
+    epochs: int = 20,
+    eval_n: int = 200,
+    base_model: str | None = None,
+    gen_budget_usd: float = 80.0,
+    eval_budget_usd: float = 60.0,
+) -> Recipe:
+    """Build a :class:`Recipe` from a flowchart on disk and run parameters.
+
+    Pure helper — no modal calls — used by the :func:`run` local entrypoint and
+    exercised directly in unit tests. Resolves the path, reads the YAML (via the
+    LangGraph adapter for ``.py``), picks the flowchart's own ``name`` if the
+    caller did not pass one, and fills the default base model for the chosen
+    size.
+
+    Args:
+        flowchart_path: Path to a ``.yaml`` / ``.yml`` flowchart or a ``.py``
+            LangGraph file.
+        name: Optional recipe name; defaults to the YAML's ``name`` field, or
+            ``path.stem`` if neither is set.
+        size: ``"3b"`` or ``"8b"``.
+        n: Number of conversations to generate.
+        epochs: Training epochs.
+        eval_n: Scenarios per eval condition.
+        base_model: Optional HF base model id; defaults to
+            :data:`DEFAULT_BASE_FOR_SIZE` for ``size``.
+        gen_budget_usd: Hard USD cap for the data-generation step.
+        eval_budget_usd: Hard USD cap for the evaluation step.
+
+    Returns:
+        A fully-populated :class:`Recipe`.
+
+    Raises:
+        ValueError: If ``size`` is not ``"3b"`` / ``"8b"``, or the path suffix
+            is not supported.
+        FileNotFoundError: If ``flowchart_path`` does not exist.
+    """
+    from typing import cast
+
+    import yaml as _yaml
+
+    from subterranean.training.config import ModelSize
+
+    size_lc = size.lower()
+    if size_lc not in {"3b", "8b"}:
+        raise ValueError(f"Unsupported size {size!r}; expected '3b' or '8b'.")
+    size_typed = cast(ModelSize, size_lc)
+
+    path = Path(flowchart_path).expanduser().resolve()
+    yaml_text = _load_flowchart_yaml_text(path)
+    parsed = _yaml.safe_load(yaml_text)
+    parsed_name: str | None = None
+    if isinstance(parsed, dict):
+        candidate = parsed.get("name")
+        if isinstance(candidate, str):
+            parsed_name = candidate
+    flow_name = name or parsed_name or path.stem
+
+    resolved_base = base_model or DEFAULT_BASE_FOR_SIZE[size_typed]
+
+    return Recipe(
+        name=flow_name,
+        flowchart_yaml=yaml_text,
+        size=size_typed,
+        base_model=resolved_base,
+        n_convos=n,
+        epochs=epochs,
+        eval_n=eval_n,
+        gen_budget_usd=gen_budget_usd,
+        eval_budget_usd=eval_budget_usd,
+    )
 
 
-def _reproduce(recipe: ExampleRecipe) -> dict[str, Any]:
-    """Chain generate -> train -> evaluate for one reproduction recipe.
+@app.local_entrypoint()  # type: ignore[untyped-decorator]  # modal decorators are Any
+def run(
+    flowchart_path: str,
+    name: str | None = None,
+    size: str = "3b",
+    n: int = 2000,
+    epochs: int = 20,
+    eval_n: int = 200,
+    base_model: str | None = None,
+    skip_eval: bool = False,
+    serve_after: bool = False,
+    yes: bool = False,
+) -> None:
+    """Generic pipeline entrypoint: generate → train → (optional) evaluate → (optional) serve.
+
+    Reads the flowchart from disk (YAML or LangGraph ``.py``), embeds the YAML
+    into a :class:`Recipe`, and chains the worker functions on Modal. Outputs
+    land under ``recipe.name`` on the build / model volumes.
+
+    Run with::
+
+        modal run -m subterranean.cloud.modal_app::run -- \\
+            --flowchart-path my_workflow.yaml --size 3b --n 2000 --epochs 20
+
+    Args:
+        flowchart_path: Path to a ``.yaml`` / ``.yml`` flowchart or LangGraph
+            ``.py``.
+        name: Recipe name; defaults to the YAML's ``name`` (or file stem).
+        size: ``"3b"`` or ``"8b"`` training path.
+        n: Number of conversations to generate.
+        epochs: Training epochs.
+        eval_n: Scenarios per eval condition.
+        base_model: HF base model id; defaults to the size's preset.
+        skip_eval: If True, skip the evaluation step.
+        serve_after: If True, also launch the autoscaling serve endpoint after
+            training (and eval, if not skipped).
+        yes: If True, skip the interactive cost-confirmation prompt. Required
+            for non-interactive (CI) invocations.
+    """
+    from subterranean.cloud._costs import confirm_cost_or_exit
+    from subterranean.logging import logger
+
+    recipe = build_recipe_from_path(
+        flowchart_path,
+        name=name,
+        size=size,
+        n=n,
+        epochs=epochs,
+        eval_n=eval_n,
+        base_model=base_model,
+    )
+    logger.info(
+        f"Running {recipe.name} ({recipe.size}) on Modal: "
+        f"{recipe.n_convos} convos, {recipe.epochs} epochs."
+    )
+    confirm_cost_or_exit(recipe, yes=yes)
+
+    dataset = generate_data.remote(recipe)
+    train_fn = {"3b": train_3b, "8b": train_8b}[recipe.size]
+    model = train_fn.remote(recipe, dataset)
+    if not skip_eval:
+        scores = evaluate.remote(recipe, model)
+        print(f"[{recipe.name}] eval scores: {scores}")
+    if serve_after:
+        serve.remote(recipe, model)
+
+
+def _reproduce(recipe: Recipe, *, yes: bool = False) -> dict[str, Any]:
+    """Chain generate -> train -> evaluate for one paper-reproduction recipe.
 
     Dispatches training to :func:`train_3b` or :func:`train_8b` based on the
     recipe's model size, then runs evaluation against the ``in_context`` upper
-    bound. Each step is a remote Modal call (``.remote``).
+    bound. Each step is a remote Modal call (``.remote``). Prints a cost
+    estimate and prompts to continue unless ``yes`` is True.
 
     Args:
-        recipe: The per-example reproduction recipe.
+        recipe: The reproduction recipe.
+        yes: If True, skip the interactive cost-confirmation prompt.
 
     Returns:
         The serialised evaluation result for the run.
     """
-    from subterranean.generation.generator import DEFAULT_MODEL
+    from subterranean.cloud._costs import confirm_cost_or_exit
     from subterranean.logging import logger
 
     logger.info(f"Reproducing {recipe.name} ({recipe.size}) end to end on Modal.")
+    confirm_cost_or_exit(recipe, yes=yes)
 
-    generate_data.remote(
-        recipe.name,
-        n=recipe.n_convos,
-        budget_usd=recipe.gen_budget_usd,
-        model=DEFAULT_MODEL,
-    )
-
+    dataset = generate_data.remote(recipe)
     trainer = train_3b if recipe.size == "3b" else train_8b
-    trainer.remote(recipe.name)
-
+    model = trainer.remote(recipe, dataset)
     return evaluate.remote(  # type: ignore[no-any-return]
-        recipe.name,
-        n=recipe.eval_n,
-        budget_usd=recipe.eval_budget_usd,
+        recipe,
+        model,
         baselines=("in_context",),
     )
 
 
 @app.local_entrypoint()  # type: ignore[untyped-decorator]  # modal decorators are Any
-def reproduce_travel() -> None:
+def reproduce_travel(yes: bool = False) -> None:
     """Reproduce the Travel experiment (Qwen2.5-3B, ~2000 convos, 20 epochs).
 
     Run with ``modal run -m subterranean.cloud.modal_app::reproduce_travel``.
+
+    Args:
+        yes: If True, skip the interactive cost-confirmation prompt.
     """
-    _reproduce(get_recipe("travel"))
+    _reproduce(get_recipe("travel"), yes=yes)
 
 
 @app.local_entrypoint()  # type: ignore[untyped-decorator]  # modal decorators are Any
-def reproduce_zoom() -> None:
+def reproduce_zoom(yes: bool = False) -> None:
     """Reproduce the Zoom experiment (Qwen3-8B, ~6000 convos, 10 epochs).
 
     Run with ``modal run -m subterranean.cloud.modal_app::reproduce_zoom``.
+
+    Args:
+        yes: If True, skip the interactive cost-confirmation prompt.
     """
-    _reproduce(get_recipe("zoom"))
+    _reproduce(get_recipe("zoom"), yes=yes)
 
 
 @app.local_entrypoint()  # type: ignore[untyped-decorator]  # modal decorators are Any
-def reproduce_insurance() -> None:
+def reproduce_insurance(yes: bool = False) -> None:
     """Reproduce the Insurance experiment (Qwen3-8B, 55 nodes, ~3000 convos, 20 epochs).
 
     Run with ``modal run -m subterranean.cloud.modal_app::reproduce_insurance``.
+
+    Args:
+        yes: If True, skip the interactive cost-confirmation prompt.
     """
-    _reproduce(get_recipe("insurance"))
+    _reproduce(get_recipe("insurance"), yes=yes)
+
+
+# Re-export for users who want to import the backward-compat alias from the
+# modal module rather than the recipes module.
+__all__ = [
+    "APP_NAME",
+    "EXAMPLES",
+    "ExampleRecipe",
+    "Recipe",
+    "ServeCls",
+    "app",
+    "build_recipe_from_path",
+    "evaluate",
+    "generate_data",
+    "reproduce_insurance",
+    "reproduce_travel",
+    "reproduce_zoom",
+    "run",
+    "serve",
+    "train_3b",
+    "train_8b",
+]

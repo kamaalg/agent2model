@@ -46,6 +46,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import yaml
 from langgraph.graph import END, START, StateGraph
 
 from subterranean.exceptions import FlowchartValidationError
@@ -254,3 +255,52 @@ def load_stategraph_from_pyfile(path: Path) -> AnyStateGraph:
         f"variable named one of {_VARIABLE_NAMES}, or a zero-argument factory named "
         f"one of {_FACTORY_NAMES}."
     )
+
+
+def flowchart_to_yaml_text(flowchart: Flowchart) -> str:
+    """Serialise a :class:`Flowchart` IR object to YAML text.
+
+    Uses Pydantic's ``model_dump(mode="json", exclude_none=True)`` so the dump
+    round-trips cleanly through :meth:`Flowchart.model_validate`. The output is
+    the same shape the YAML loader accepts (``name`` / ``start`` / ``nodes`` /
+    optional ``scenario_variables``), without dropping fields that Pydantic
+    treats as defaults.
+
+    Args:
+        flowchart: The IR object to dump.
+
+    Returns:
+        A YAML string suitable for embedding in a :class:`Recipe.flowchart_yaml`
+        or persisting to ``flowchart.yaml`` on a build volume.
+
+    Example:
+        >>> text = flowchart_to_yaml_text(fc)
+        >>> Flowchart.model_validate(yaml.safe_load(text)).name == fc.name
+        True
+    """
+    payload = flowchart.model_dump(mode="json", exclude_none=True)
+    return yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+
+
+def langgraph_to_yaml_text(path: Path, *, name: str | None = None) -> str:
+    """Load a LangGraph ``.py`` file and dump the converted Flowchart to YAML.
+
+    Convenience composition of :func:`load_stategraph_from_pyfile`,
+    :func:`flowchart_from_stategraph`, and :func:`flowchart_to_yaml_text`. Used
+    by the generic Modal ``run`` entrypoint and the ``subterranean cloud run``
+    CLI so a user can point at either a ``.py`` LangGraph file or a YAML file.
+
+    Args:
+        path: Path to a ``.py`` file defining a LangGraph graph.
+        name: Optional explicit name for the resulting flowchart. Defaults to
+            ``path.stem``.
+
+    Returns:
+        YAML text representing the converted flowchart.
+
+    Raises:
+        FlowchartValidationError: If the file cannot be loaded or converted.
+    """
+    graph = load_stategraph_from_pyfile(path)
+    flowchart = flowchart_from_stategraph(graph, name=name or path.stem)
+    return flowchart_to_yaml_text(flowchart)

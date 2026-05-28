@@ -43,6 +43,7 @@ nav:
   - IR spec reference: ir-spec.md
   - Training guide: training.md
   - Evaluation guide: evaluation.md
+  - Cloud quickstart: cloud-quickstart.md
   - Cloud deployment: cloud.md
   - Troubleshooting: troubleshooting.md
   - FAQ: faq.md
