@@ -253,7 +253,16 @@ def _run_vllm_server(args: list[str]) -> None:  # pragma: no cover - GPU host on
     # Lazy imports: vLLM is GPU/CUDA-only and absent on dev machines.
     from vllm.entrypoints.openai.api_server import run_server
     from vllm.entrypoints.openai.cli_args import make_arg_parser
-    from vllm.utils import FlexibleArgumentParser
+
+    # FlexibleArgumentParser moved out of vllm.utils in newer releases (≥~0.7);
+    # try the newer location first, fall back to the historical one.
+    try:
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+    except ImportError:
+        try:
+            from vllm.utils.argparse import FlexibleArgumentParser
+        except ImportError:
+            from vllm.utils import FlexibleArgumentParser
 
     parser = make_arg_parser(FlexibleArgumentParser(description="subterranean vLLM OpenAI server"))
     parsed = parser.parse_args(args)
