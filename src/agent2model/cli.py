@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
+from importlib import resources
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -99,6 +101,50 @@ def _require_anthropic_key() -> None:
         raise typer.Exit(code=1)
 
 
+#: Bundled example workflows shipped inside the wheel under ``agent2model/_examples``.
+_BUNDLED_EXAMPLES = ("travel_booking", "zoom_support", "insurance_claims", "langgraph_demo")
+
+
+def _examples_root() -> Path | None:
+    """Locate the bundled examples directory.
+
+    Examples ship *inside* the wheel at ``agent2model/_examples`` (see the
+    ``force-include`` in ``pyproject.toml``), not in the user's working
+    directory. In an editable/dev checkout that directory does not exist, so fall
+    back to the repo's top-level ``examples/``. Returns ``None`` if neither is
+    found.
+    """
+    packaged = resources.files("agent2model") / "_examples"
+    if packaged.is_dir():
+        return Path(str(packaged))
+    # Editable/dev fallback: <repo>/examples, two levels up from this package.
+    dev = Path(__file__).resolve().parent.parent.parent / "examples"
+    return dev if dev.is_dir() else None
+
+
+def _available_examples_str() -> str:
+    """Comma-separated names of bundled examples, for error/help messages."""
+    root = _examples_root()
+    if root is None:
+        return ", ".join(_BUNDLED_EXAMPLES)
+    return ", ".join(sorted(p.name for p in root.iterdir() if p.is_dir()))
+
+
+def _validate_positive_budget(budget: float) -> None:
+    """Reject a non-positive ``--budget`` with a friendly Typer error.
+
+    ``GenerationConfig``/``EvalConfig`` constrain ``budget_usd > 0``; constructing
+    them with ``--budget 0`` (a natural "spend nothing" guard) would otherwise
+    surface a raw pydantic ``ValidationError`` traceback. Catch it at the CLI
+    boundary instead.
+    """
+    if budget <= 0:
+        raise typer.BadParameter(
+            f"--budget must be greater than 0 (got {budget:g}). "
+            "Use --dry-run to preview the estimated cost without spending."
+        )
+
+
 @app.command()
 def compile(
     source: Annotated[
@@ -114,6 +160,14 @@ def compile(
     carry no natural-language instructions); these still validate and should be
     filled in before generating data.
     """
+    if not source.exists():
+        logger.error(
+            f"No such file: {source}. Bundled examples ship inside the package, not your "
+            "working directory — copy one first with `agent2model init <example>` (e.g. "
+            "`agent2model init travel_booking`), then compile the copied path. "
+            f"Available examples: {_available_examples_str()}."
+        )
+        raise typer.Exit(code=1)
     try:
         if source.suffix == ".py":
             # Imported lazily so the CLI works without the optional langgraph extra.
@@ -163,6 +217,59 @@ def compile(
         )
 
 
+@app.command()
+def init(
+    example: Annotated[
+        str,
+        typer.Argument(
+            help="Bundled example to copy: travel_booking, zoom_support, "
+            "insurance_claims, or langgraph_demo."
+        ),
+    ],
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Destination directory. Defaults to ./<example>."),
+    ] = None,
+) -> None:
+    """Copy a bundled example workflow into your working directory.
+
+    The examples referenced in the quickstart ship *inside* the installed
+    package, not in your current directory, so a literal ``pip install`` user has
+    nothing to ``compile`` yet. This materialises one so the four-command journey
+    works from a fresh install:
+
+    Example:
+        $ agent2model init travel_booking
+        $ agent2model compile travel_booking/flowchart.yaml --out build/travel
+
+    Args:
+        example: Name of a bundled example.
+        out: Destination directory; defaults to ``./<example>``.
+    """
+    root = _examples_root()
+    if root is None:
+        logger.error(
+            "Could not locate the bundled examples. Reinstall agent2model, or copy an "
+            "example from the source repository's examples/ directory."
+        )
+        raise typer.Exit(code=1)
+    src = root / example
+    if not src.is_dir():
+        logger.error(f"Unknown example '{example}'. Available: {_available_examples_str()}.")
+        raise typer.Exit(code=2)
+    dest = out if out is not None else Path(example)
+    if dest.exists():
+        logger.error(f"Destination {dest} already exists; remove it or pass a different --out.")
+        raise typer.Exit(code=1)
+    shutil.copytree(src, dest)
+    flowchart = dest / "flowchart.yaml"
+    next_src = flowchart if flowchart.exists() else dest
+    logger.info(
+        f"Copied example '{example}' → {dest}. "
+        f"Next: agent2model compile {next_src} --out build/{example}"
+    )
+
+
 def _load_compiled_flowchart(build_dir: Path) -> Flowchart:
     """Load and graph-validate the compiled ``flowchart.json`` from a build dir."""
     ir_path = build_dir / "flowchart.json"
@@ -196,15 +303,23 @@ def generate(
             help="Skip the cost-confirmation prompt (use for non-interactive runs).",
         ),
     ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Print the estimated cost and exit without an API key or any API calls.",
+        ),
+    ] = False,
 ) -> None:
     """Generate synthetic training data by walking the compiled flowchart.
 
     Reads ``<BUILD_DIR>/flowchart.json``, samples ``--n`` conversations via
     Claude, prints the expected cost before starting and the actual cost after,
     and writes the HF chat-template dataset to ``<BUILD_DIR>/dataset.jsonl``.
-    Generation is resumable and stops if the ``--budget`` cap is reached.
+    Generation is resumable and stops if the ``--budget`` cap is reached. Pass
+    ``--dry-run`` to see the cost estimate with no API key and no spending.
     """
-    _require_anthropic_key()
+    _validate_positive_budget(budget)
     try:
         flowchart = _load_compiled_flowchart(build_dir)
     except FlowchartValidationError as exc:
@@ -229,6 +344,8 @@ def generate(
     config = GenerationConfig(
         n=n, model=model, budget_usd=budget, seed=seed, max_concurrent=max_concurrent
     )
+    # Estimate depends only on n/model/flowchart — no key needed — so print it
+    # before the API-key check so cost is visible even without credentials.
     expected = estimate_cost(config)
     logger.info(f"Expected cost for {n} conversations with {model}: ~${expected:.2f}")
     if expected > budget:
@@ -236,6 +353,11 @@ def generate(
             f"Expected cost ~${expected:.2f} exceeds the ${budget:.2f} budget; "
             "generation may stop before completing all conversations."
         )
+    if dry_run:
+        logger.info("Dry run: estimate only — no API key required, no API calls, no data written.")
+        raise typer.Exit(code=0)
+
+    _require_anthropic_key()
     if not yes and not typer.confirm(
         f"Proceed with generation (~${expected:.2f}, hard cap ${budget:.2f})?", default=True
     ):
@@ -388,6 +510,13 @@ def eval(
             help="Skip the cost-confirmation prompt (use for non-interactive runs).",
         ),
     ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Print the estimated cost and exit without an API key or any API calls.",
+        ),
+    ] = False,
 ) -> None:
     """Evaluate a compiled model against baselines with the paper's rubric.
 
@@ -406,7 +535,7 @@ def eval(
     from agent2model.eval.runner import EvalConfig, EvalRunner, estimate_eval_cost
     from agent2model.exceptions import EvalBudgetExceeded, EvalError
 
-    _require_anthropic_key()
+    _validate_positive_budget(budget)
     try:
         flowchart = _load_compiled_flowchart(build_dir)
     except FlowchartValidationError as exc:
@@ -446,6 +575,13 @@ def eval(
             f"Expected cost ~${expected:.2f} exceeds the ${budget:.2f} budget; "
             "the run may stop before completing."
         )
+    if dry_run:
+        logger.info(
+            "Dry run: estimate only — no API key required, no API calls, no report written."
+        )
+        raise typer.Exit(code=0)
+
+    _require_anthropic_key()
     if not yes and not typer.confirm(
         f"Proceed with evaluation (~${expected:.2f}, hard cap ${budget:.2f})?", default=True
     ):

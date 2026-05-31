@@ -75,7 +75,9 @@ fails if any criterion drops >5% below the paper number.
 | Graceful Handling | 4.81 | — |
 | Naturalness | 4.92 | — |
 
-**Cost:** ~$0.0007 per conversation, **462×** cheaper than the in-context
-frontier baseline, at 87–98% of frontier quality. (The deep procedure makes the
+**Cost (paper's figures):** the paper reports ~$0.0007 per conversation, **462×**
+cheaper than the in-context frontier baseline, at 87–98% of frontier quality —
+numbers this repo has **not yet reproduced** (see the "Your run" column above and
+[`benchmarks/`](../../benchmarks/README.md)). (The deep procedure makes the
 in-context baseline especially expensive — the entire 59-node flowchart sits in
 every system prompt — which is why the cost ratio is the largest of the three.)

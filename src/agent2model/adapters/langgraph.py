@@ -344,6 +344,17 @@ def load_stategraph_from_pyfile(path: Path) -> AnyStateGraph:
     try:
         try:
             spec.loader.exec_module(module)
+        except ModuleNotFoundError as exc:
+            if (exc.name or "").split(".")[0] == "langgraph":
+                # The user's .py imports langgraph but the optional extra is absent.
+                # Echo the install hint instead of a bare "No module named 'langgraph'".
+                raise FlowchartValidationError(
+                    f"Importing {path} failed because the optional 'langgraph' extra is "
+                    "not installed. Install it with: pip install 'agent2model[langgraph]'."
+                ) from exc
+            raise FlowchartValidationError(
+                f"Failed to import LangGraph file {path}: {exc}"
+            ) from exc
         except Exception as exc:
             raise FlowchartValidationError(
                 f"Failed to import LangGraph file {path}: {exc}"

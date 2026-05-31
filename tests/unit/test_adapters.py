@@ -272,6 +272,17 @@ def test_loader_import_error(tmp_path: Path) -> None:
         load_stategraph_from_pyfile(path)
 
 
+def test_loader_missing_langgraph_extra_gives_install_hint(tmp_path: Path) -> None:
+    # When the user's graph file imports langgraph but the extra is absent, the
+    # raw `No module named 'langgraph'` should be replaced with the install hint.
+    # We simulate the missing-extra ImportError by importing a langgraph submodule
+    # that does not exist (top-level package name is still 'langgraph').
+    path = tmp_path / "needs_extra.py"
+    path.write_text("import langgraph.this_submodule_does_not_exist_xyz\n")
+    with pytest.raises(FlowchartValidationError, match=r"pip install 'agent2model\[langgraph\]'"):
+        load_stategraph_from_pyfile(path)
+
+
 def test_loader_factory_raises(tmp_path: Path) -> None:
     path = tmp_path / "bad_factory.py"
     path.write_text("def build_graph():\n    raise ValueError('boom')\n")
