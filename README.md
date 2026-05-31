@@ -67,8 +67,11 @@ Based on Dennis et al. 2026, *Compiling Agentic Workflows into LLM Weights*
 ## The 4-command pipeline
 
 ```bash
+# 0. Copy a bundled example into your working dir (they ship inside the package).
+agent2model init travel_booking
+
 # 1. Validate a workflow and emit the canonical IR.   [free, offline, no GPU]
-agent2model compile examples/travel_booking/flowchart.yaml --out build/travel
+agent2model compile travel_booking/flowchart.yaml --out build/travel
 
 # 2. Generate synthetic training conversations via Claude.  [Anthropic API $; --budget caps it]
 agent2model generate build/travel --n 2000 --budget 60

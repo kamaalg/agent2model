@@ -351,3 +351,83 @@ def test_cloud_setup_runs_to_completion(runner: CliRunner, monkeypatch: pytest.M
     assert result.exit_code == 0
     assert "anthropic_secret" in result.output
     assert "Ready" in result.output or "Setup" in result.output
+
+
+# --- init / compile-not-found / budget / dry-run ---------------------------
+
+
+def test_init_copies_bundled_example(runner: CliRunner, tmp_path: Path) -> None:
+    dest = tmp_path / "ex"
+    result = runner.invoke(app, ["init", "travel_booking", "--out", str(dest)])
+    assert result.exit_code == 0, result.output
+    assert (dest / "flowchart.yaml").exists()
+
+
+def test_init_unknown_example_exits_two(runner: CliRunner, tmp_path: Path) -> None:
+    dest = tmp_path / "ex"
+    result = runner.invoke(app, ["init", "does_not_exist", "--out", str(dest)])
+    assert result.exit_code == 2
+    assert not dest.exists()
+
+
+def test_init_refuses_to_overwrite(runner: CliRunner, tmp_path: Path) -> None:
+    dest = tmp_path / "ex"
+    dest.mkdir()
+    result = runner.invoke(app, ["init", "travel_booking", "--out", str(dest)])
+    assert result.exit_code == 1
+
+
+def test_compile_missing_file_hints_init(runner: CliRunner, tmp_path: Path) -> None:
+    # A pip-only user's CWD has no examples/ dir; the missing-file error should
+    # point them at `agent2model init`. Use a path under tmp_path so it is
+    # genuinely absent regardless of the test runner's working directory.
+    missing = tmp_path / "examples" / "travel_booking" / "flowchart.yaml"
+    result = runner.invoke(app, ["compile", str(missing), "--out", str(tmp_path / "b")])
+    assert result.exit_code == 1
+    assert "agent2model init" in _plain(result.output)
+
+
+def _compiled_build_dir(runner: CliRunner, tmp_path: Path) -> Path:
+    """init + compile a bundled example, returning a build dir with flowchart.json."""
+    src = tmp_path / "ex"
+    assert runner.invoke(app, ["init", "travel_booking", "--out", str(src)]).exit_code == 0
+    build = tmp_path / "build"
+    res = runner.invoke(app, ["compile", str(src / "flowchart.yaml"), "--out", str(build)])
+    assert res.exit_code == 0, res.output
+    assert (build / "flowchart.json").exists()
+    return build
+
+
+def test_generate_budget_zero_is_friendly_not_traceback(runner: CliRunner, tmp_path: Path) -> None:
+    build = _compiled_build_dir(runner, tmp_path)
+    result = runner.invoke(app, ["generate", str(build), "--n", "5", "--budget", "0"])
+    # typer.BadParameter -> usage error, exit 2, and no pydantic ValidationError.
+    assert result.exit_code == 2
+    assert "ValidationError" not in result.output
+
+
+def test_generate_dry_run_estimates_without_key_or_spend(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    build = _compiled_build_dir(runner, tmp_path)
+    result = runner.invoke(app, ["generate", str(build), "--n", "5", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    # Dry run must not require a key and must not write a dataset.
+    assert not (build / "dataset.jsonl").exists()
+
+
+def test_eval_dry_run_estimates_without_key_or_report(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    build = _compiled_build_dir(runner, tmp_path)
+    result = runner.invoke(app, ["eval", str(build), "--n", "5", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert not (build / "eval_report.json").exists()
+
+
+def test_generate_help_advertises_dry_run(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["generate", "--help"])
+    assert result.exit_code == 0
+    assert "--dry-run" in _plain(result.output)
