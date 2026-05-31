@@ -67,5 +67,7 @@ paper number (see [`benchmarks/`](../../benchmarks/README.md)).
 | Graceful Handling | 4.07 | — |
 | Naturalness | 4.12 | — |
 
-**Cost:** ~$0.0010 per conversation, **128×** cheaper than the in-context
-frontier baseline, at 87–98% of frontier quality.
+**Cost (paper's figures):** the paper reports ~$0.0010 per conversation, **128×**
+cheaper than the in-context frontier baseline, at 87–98% of frontier quality.
+These are the paper's numbers — this repo has **not yet reproduced** them (see the
+"Your run" column above and [`benchmarks/`](../../benchmarks/README.md)).
