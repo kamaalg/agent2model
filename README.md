@@ -4,7 +4,11 @@
 
 ### Turn your LangGraph agent into a small open model that runs with **no orchestrator**.
 
+<img src="assets/hero.svg" alt="The old way re-sends the whole procedure to a frontier model on every turn; agent2model compiles the procedure into a small model's weights so it self-orchestrates with no per-turn frontier calls." width="100%">
+
 [![CI](https://github.com/kamaalg/agent2model/actions/workflows/ci.yml/badge.svg)](https://github.com/kamaalg/agent2model/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/agent2model.svg)](https://pypi.org/project/agent2model/)
+[![Downloads](https://img.shields.io/pypi/dm/agent2model.svg)](https://pypi.org/project/agent2model/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/kamaalg/agent2model/blob/main/LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#what-v1-ships)
@@ -15,37 +19,7 @@
 
 ---
 
-## The idea in one diagram
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                                                                          │
-│   THE OLD WAY                            THE agent2model WAY              │
-│   ───────────                            ──────────────────              │
-│                                                                          │
-│   ┌──────────────┐                       ┌──────────────────┐            │
-│   │ User message │                       │   User message   │            │
-│   └──────┬───────┘                       └────────┬─────────┘            │
-│          │                                        │                      │
-│          ▼                                        ▼                      │
-│   ┌──────────────┐                       ┌──────────────────┐            │
-│   │  LangGraph   │  (every turn:         │  Compiled small  │  one call: │
-│   │ orchestrator │   prompt + entire     │   model (Qwen)   │  procedure │
-│   └──────┬───────┘   flowchart sent      └────────┬─────────┘  is in the │
-│          │           to frontier)                 │             weights  │
-│          ▼                                        ▼                      │
-│   ┌──────────────┐                       ┌──────────────────┐            │
-│   │   Sonnet/    │                       │  Agent response  │            │
-│   │   GPT-4      │  ($$$ per turn)       │   (no Claude)    │  (¢¢/turn) │
-│   └──────┬───────┘                       └──────────────────┘            │
-│          │                                                               │
-│          ▼                                                               │
-│   ┌──────────────┐                                                       │
-│   │Agent response│                                                       │
-│   └──────────────┘                                                       │
-│                                                                          │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+## How it works
 
 You describe your agent's procedure once — or import it from a LangGraph
 `StateGraph`. `agent2model` walks the procedure, has Claude write thousands of
@@ -176,6 +150,21 @@ flowchart TD
 Diamonds are `decision` nodes (resolved only at generation time), rounded boxes are
 `user` turns, and terminals are coloured by outcome. `agent2model show <build> --format
 summary` prints node/path counts instead.
+
+### Preview the whole pipeline offline — no API key, no GPU
+
+Want to see the dataset shape and the eval report before spending a cent?
+
+```bash
+agent2model generate build/travel --n 5 --mock   # templated conversations, $0, no key
+agent2model eval     build/travel --demo          # render the JSON + PDF eval report
+```
+
+`--mock` writes a templated (non-LLM) `dataset.jsonl` so you can inspect the
+chat-template format and sampled paths; `--demo` renders the real report layout
+(per-criterion bars, bootstrap CIs, failure rates, cost breakdown) from illustrative
+scores. Both are clearly labelled as previews — **not** training data or measured
+results.
 
 ---
 
