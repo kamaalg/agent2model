@@ -28,6 +28,7 @@ from agent2model.exceptions import (
     FlowchartValidationError,
     GenerationBudgetExceeded,
     ServingError,
+    StaleCheckpointError,
     TrainingDivergedError,
 )
 from agent2model.generation.formatter import write_dataset
@@ -396,6 +397,14 @@ def generate(
             help="Print the estimated cost and exit without an API key or any API calls.",
         ),
     ] = False,
+    mock: Annotated[
+        bool,
+        typer.Option(
+            "--mock",
+            help="Write templated (non-LLM) conversations offline — no API key, no cost. "
+            "Lets you preview the dataset shape; NOT training-quality data.",
+        ),
+    ] = False,
 ) -> None:
     """Generate synthetic training data by walking the compiled flowchart.
 
@@ -403,7 +412,8 @@ def generate(
     Claude, prints the expected cost before starting and the actual cost after,
     and writes the HF chat-template dataset to ``<BUILD_DIR>/dataset.jsonl``.
     Generation is resumable and stops if the ``--budget`` cap is reached. Pass
-    ``--dry-run`` to see the cost estimate with no API key and no spending.
+    ``--dry-run`` to see the cost estimate with no API key and no spending, or
+    ``--mock`` to write a free, offline, templated preview dataset.
     """
     _validate_positive_budget(budget)
     try:
@@ -430,6 +440,20 @@ def generate(
     config = GenerationConfig(
         n=n, model=model, budget_usd=budget, seed=seed, max_concurrent=max_concurrent
     )
+
+    if mock:
+        from agent2model.generation.generator import generate_mock
+
+        conversations = generate_mock(flowchart, config)
+        dataset_path = build_dir / "dataset.jsonl"
+        written = write_dataset(conversations, dataset_path)
+        logger.info(
+            f"Mock generation: wrote {written} TEMPLATED conversations to {dataset_path} "
+            "(no API calls, $0). This previews the dataset shape — it is NOT "
+            "training-quality data. Drop --mock to generate real conversations."
+        )
+        raise typer.Exit(code=0)
+
     # Estimate depends only on n/model/flowchart — no key needed — so print it
     # before the API-key check so cost is visible even without credentials.
     expected = estimate_cost(config)
@@ -453,6 +477,9 @@ def generate(
     generator = ConversationGenerator(flowchart, config)
     try:
         conversations = asyncio.run(generator.run(build_dir))
+    except StaleCheckpointError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(code=1) from exc
     except GenerationBudgetExceeded as exc:
         logger.error(str(exc))
         logger.error(f"Actual cost when stopped: ${generator.cost.cost_usd:.4f}")
@@ -603,6 +630,14 @@ def eval(
             help="Print the estimated cost and exit without an API key or any API calls.",
         ),
     ] = False,
+    demo: Annotated[
+        bool,
+        typer.Option(
+            "--demo",
+            help="Render an illustrative report from canned scores — no API, no GPU. "
+            "Numbers are sampled around the paper's means, NOT a measurement.",
+        ),
+    ] = False,
 ) -> None:
     """Evaluate a compiled model against baselines with the paper's rubric.
 
@@ -621,7 +656,6 @@ def eval(
     from agent2model.eval.runner import EvalConfig, EvalRunner, estimate_eval_cost
     from agent2model.exceptions import EvalBudgetExceeded, EvalError
 
-    _validate_positive_budget(budget)
     try:
         flowchart = _load_compiled_flowchart(build_dir)
     except FlowchartValidationError as exc:
@@ -629,6 +663,25 @@ def eval(
             logger.error(line)
         raise typer.Exit(code=1) from exc
 
+    if demo:
+        from agent2model.eval.demo import demo_eval_result
+
+        result = demo_eval_result(flowchart.name, n=n, seed=seed)
+        json_path = write_json_report(result, build_dir / "eval_report.json")
+        logger.info(f"Demo: wrote illustrative report to {json_path}")
+        try:
+            pdf_path = write_pdf_report(result, build_dir / "eval_report.pdf")
+            logger.info(f"Demo: wrote illustrative report to {pdf_path}")
+        except EvalError as exc:
+            # matplotlib (the [eval]/[docs] extra) may be absent; JSON still written.
+            logger.warning(f"Skipped PDF ({exc}); JSON report written.")
+        logger.warning(
+            "These numbers are ILLUSTRATIVE — sampled around Dennis et al. 2026's reported "
+            "means, NOT measured by this library. Run a real `eval` for own-name numbers."
+        )
+        raise typer.Exit(code=0)
+
+    _validate_positive_budget(budget)
     names = [b.strip() for b in baselines.split(",") if b.strip()]
     if served_url:
         names.append("compiled")
