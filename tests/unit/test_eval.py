@@ -553,3 +553,21 @@ def test_condition_result_roundtrips() -> None:
     dumped = cr.model_dump(mode="json")
     restored = ConditionResult.model_validate(dumped)
     assert restored.condition == "x"
+
+
+def test_demo_eval_result_is_well_formed() -> None:
+    from agent2model.eval.demo import demo_eval_result
+
+    result = demo_eval_result("travel", n=30, seed=0)
+    names = {c.condition for c in result.conditions}
+    assert {"compiled", "in_context", "langgraph", "same_model_orch"} <= names
+    assert all(c.n_conversations == 30 for c in result.conditions)
+    # Compiled is far cheaper than the in-context frontier baseline.
+    compiled = next(c for c in result.conditions if c.condition == "compiled")
+    in_context = next(c for c in result.conditions if c.condition == "in_context")
+    assert compiled.cost_usd < in_context.cost_usd
+    # Each baseline is compared against compiled, with CIs and p-values populated.
+    assert len(result.comparisons) == 3
+    for c in result.conditions:
+        assert all(1.0 <= s.mean <= 5.0 for s in c.criterion_stats)
+        assert all(s.ci_low <= s.mean <= s.ci_high for s in c.criterion_stats)
