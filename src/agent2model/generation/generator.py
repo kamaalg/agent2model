@@ -26,6 +26,7 @@ Token usage and cost are written to ``build/<name>/cost.json``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -42,7 +43,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from agent2model.exceptions import GenerationBudgetExceeded
+from agent2model.exceptions import GenerationBudgetExceeded, StaleCheckpointError
 from agent2model.generation.formatter import Conversation, Turn
 from agent2model.generation.scenarios import Scenario, sample_scenario
 from agent2model.generation.traversal import TraversalConfig, sample_path
@@ -374,7 +375,19 @@ class ConversationGenerator:
         """
         build_dir.mkdir(parents=True, exist_ok=True)
         state_path = build_dir / "generation_state.json"
-        completed, self.cost = _load_checkpoint(state_path, self.config.model)
+        fingerprint = _flowchart_fingerprint(self.flowchart)
+        completed, self.cost, saved_fp = _load_checkpoint(state_path, self.config.model)
+
+        # Refuse to resume a checkpoint produced from a *different* flowchart —
+        # otherwise we'd silently mix conversations from two procedures.
+        if completed and saved_fp is not None and saved_fp != fingerprint:
+            raise StaleCheckpointError(
+                f"{state_path} holds {len(completed)} conversation(s) generated from a "
+                "different flowchart than the one now in this build dir. Resuming would mix "
+                "two procedures into one dataset. Delete the stale dataset.jsonl and "
+                "generation_state.json in this build dir to regenerate, or compile into a "
+                "fresh --out directory."
+            )
 
         remaining = [i for i in range(self.config.n) if str(i) not in completed]
         logger.info(
@@ -405,17 +418,17 @@ class ConversationGenerator:
                     progress.advance(task)
                     done_since_checkpoint += 1
                     if done_since_checkpoint >= self.config.checkpoint_every:
-                        _save_checkpoint(state_path, completed, self.cost)
+                        _save_checkpoint(state_path, completed, self.cost, fingerprint)
                         done_since_checkpoint = 0
 
             try:
                 await asyncio.gather(*(worker(i) for i in remaining))
             except GenerationBudgetExceeded:
-                _save_checkpoint(state_path, completed, self.cost)
+                _save_checkpoint(state_path, completed, self.cost, fingerprint)
                 _write_cost(build_dir, self.cost)
                 raise
 
-        _save_checkpoint(state_path, completed, self.cost)
+        _save_checkpoint(state_path, completed, self.cost, fingerprint)
         _write_cost(build_dir, self.cost)
         logger.info(
             f"Generated {len(completed)} conversations; " f"actual cost ${self.cost.cost_usd:.4f}."
@@ -427,20 +440,67 @@ class ConversationGenerator:
         ]
 
 
-def _load_checkpoint(state_path: Path, model: str) -> tuple[dict[str, Any], CostTracker]:
-    """Load completed conversations and restored cost totals from a checkpoint.
+def generate_mock(flowchart: Flowchart, config: GenerationConfig) -> list[Conversation]:
+    """Build templated conversations offline, with no API calls or key.
+
+    Walks a sampled path per conversation (the same sampler the real generator
+    uses) and fills each speaking turn from the node's prompt template rather than
+    calling Claude. The result is *not* training-quality data — turns are
+    placeholder text — but it lets a user see the exact dataset shape, sampled
+    paths, and chat-template format for free, and makes the whole pipeline
+    demoable without credentials. Deterministic for a fixed ``config.seed``.
+
+    Args:
+        flowchart: A validated flowchart.
+        config: Run configuration (``n`` and ``seed`` drive sampling).
+
+    Returns:
+        ``config.n`` templated conversations.
+    """
+    conversations: list[Conversation] = []
+    for index in range(config.n):
+        rng = random.Random(f"{config.seed}:{index}")
+        path = sample_path(flowchart, rng, config=config.traversal)
+        scenario = sample_scenario(flowchart, rng)
+        turns: list[Turn] = []
+        for node_id in path:
+            node = flowchart.nodes[node_id]
+            if node.role == "agent":
+                turns.append(
+                    Turn(
+                        role="assistant",
+                        content=f"[mock agent turn] {_format_prompt(node, scenario)}",
+                    )
+                )
+            elif node.role == "user":
+                turns.append(Turn(role="user", content="[mock customer turn]"))
+        conversations.append(Conversation(turns=turns))
+    return conversations
+
+
+def _flowchart_fingerprint(flowchart: Flowchart) -> str:
+    """A stable content hash of the flowchart, used to detect stale checkpoints."""
+    canonical = json.dumps(flowchart.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _load_checkpoint(
+    state_path: Path, model: str
+) -> tuple[dict[str, Any], CostTracker, str | None]:
+    """Load completed conversations, cost totals, and the flowchart fingerprint.
 
     Args:
         state_path: Path to ``generation_state.json``.
         model: Model id for the rebuilt cost tracker.
 
     Returns:
-        A ``(conversations, cost_tracker)`` pair. The conversations map is keyed
-        by index string; the cost tracker carries forward token totals from a
-        prior run so the final ``cost.json`` reflects the whole effort.
+        A ``(conversations, cost_tracker, fingerprint)`` triple. The conversations
+        map is keyed by index string; the cost tracker carries forward token totals
+        from a prior run; ``fingerprint`` is the flowchart hash recorded when the
+        checkpoint was written (``None`` for checkpoints from older versions).
     """
     if not state_path.exists():
-        return {}, CostTracker(model=model)
+        return {}, CostTracker(model=model), None
     data = json.loads(state_path.read_text(encoding="utf-8"))
     convos: dict[str, Any] = data.get("conversations", {})
     saved = data.get("cost", {})
@@ -452,13 +512,19 @@ def _load_checkpoint(state_path: Path, model: str) -> tuple[dict[str, Any], Cost
         cache_read_input_tokens=saved.get("cache_read_input_tokens", 0),
         api_calls=saved.get("api_calls", 0),
     )
-    return convos, cost
+    return convos, cost, data.get("flowchart_fingerprint")
 
 
-def _save_checkpoint(state_path: Path, completed: dict[str, Any], cost: CostTracker) -> None:
-    """Persist completed conversations and cost totals to the checkpoint file."""
+def _save_checkpoint(
+    state_path: Path, completed: dict[str, Any], cost: CostTracker, fingerprint: str
+) -> None:
+    """Persist completed conversations, cost totals, and the flowchart fingerprint."""
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"conversations": completed, "cost": cost.to_report()}
+    payload = {
+        "flowchart_fingerprint": fingerprint,
+        "conversations": completed,
+        "cost": cost.to_report(),
+    }
     state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
