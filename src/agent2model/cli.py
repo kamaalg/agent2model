@@ -38,14 +38,24 @@ from agent2model.generation.generator import (
     estimate_cost,
 )
 from agent2model.ir.loader import load_flowchart
+from agent2model.ir.render import to_mermaid, to_summary
 from agent2model.ir.schema import Flowchart
 from agent2model.ir.validator import validate
 from agent2model.logging import configure_logging, logger
 from agent2model.training.config import DENNIS_2026B, TrainingConfig
 
+_JOURNEY_EPILOG = (
+    "The canonical journey: init -> compile -> show -> generate -> train -> eval -> serve. "
+    "init, compile, and show are free and offline. generate and eval call the Anthropic API "
+    "(set ANTHROPIC_API_KEY; --budget caps spend, --dry-run previews cost for free). "
+    "train and serve need a GPU (install the 'train' / 'serve' extras). "
+    "No GPU? 'agent2model cloud run ...' runs the whole pipeline on Modal."
+)
+
 app = typer.Typer(
     name="agent2model",
     help="Turn your LangGraph agent into a small model that runs with no orchestrator.",
+    epilog=_JOURNEY_EPILOG,
     no_args_is_help=True,
     add_completion=False,
 )
@@ -168,6 +178,13 @@ def compile(
             f"Available examples: {_available_examples_str()}."
         )
         raise typer.Exit(code=1)
+    if not source.is_file():
+        logger.error(
+            f"Expected a flowchart YAML or a LangGraph .py file, but {source} is a directory. "
+            "Point `compile` at the flowchart file itself (e.g. "
+            f"`{source}/flowchart.yaml`), not the directory."
+        )
+        raise typer.Exit(code=1)
     try:
         if source.suffix == ".py":
             # Imported lazily so the CLI works without the optional langgraph extra.
@@ -192,11 +209,20 @@ def compile(
         json.dumps(flowchart.model_dump(mode="json"), indent=2, sort_keys=False),
         encoding="utf-8",
     )
+    # Emit a Mermaid diagram next to the IR — GitHub/Markdown render it inline, so
+    # the user gets a shareable picture of their procedure for free.
+    mmd_path = out / "flowchart.mmd"
+    mmd_path.write_text(to_mermaid(flowchart) + "\n", encoding="utf-8")
+
     n_nodes = len(flowchart.nodes)
     n_terminals = len(flowchart.terminals)
     logger.info(
         f"Compiled '{flowchart.name}': {n_nodes} nodes, {n_terminals} terminals → {ir_path}"
     )
+    # A short coverage summary so `compile` feels like it understood the procedure.
+    for line in to_summary(flowchart).splitlines()[1:]:
+        logger.info(line.strip())
+    logger.info(f"Diagram written to {mmd_path} — view it with `agent2model show {out}`.")
 
     # Surface data-quality gaps the user must fix before generating (especially
     # for LangGraph-derived IR): placeholder TODO prompts and missing user turns.
@@ -270,6 +296,64 @@ def init(
     )
 
 
+@app.command()
+def show(
+    target: Annotated[
+        Path,
+        typer.Argument(
+            help="A build dir (with flowchart.json), a flowchart YAML, or a LangGraph .py file."
+        ),
+    ],
+    fmt: Annotated[
+        str,
+        typer.Option("--format", help="Output format: 'mermaid' (default) or 'summary'."),
+    ] = "mermaid",
+) -> None:
+    """Visualise a procedure as a Mermaid diagram or a text summary.
+
+    Renders the compiled IR so you can *see* the procedure instead of reading
+    JSON. ``--format mermaid`` (default) prints a Mermaid ``flowchart`` — paste it
+    into a ```` ```mermaid ```` fenced block and GitHub/Markdown render it inline.
+    ``--format summary`` prints node/terminal/path counts. This is free, offline,
+    and needs no API key or GPU.
+
+    Example:
+        $ agent2model show build/travel              # Mermaid diagram to stdout
+        $ agent2model show build/travel --format summary
+    """
+    if not target.exists():
+        logger.error(f"No such path: {target}.")
+        raise typer.Exit(code=1)
+
+    try:
+        if target.is_dir():
+            flowchart = _load_compiled_flowchart(target)
+        elif target.suffix == ".py":
+            from agent2model.adapters.langgraph import (
+                flowchart_from_stategraph,
+                load_stategraph_from_pyfile,
+            )
+
+            flowchart = flowchart_from_stategraph(
+                load_stategraph_from_pyfile(target), name=target.stem
+            )
+            validate(flowchart)
+        else:
+            flowchart = load_flowchart(target)
+            validate(flowchart)
+    except FlowchartValidationError as exc:
+        for line in exc.errors:
+            logger.error(line)
+        raise typer.Exit(code=1) from exc
+
+    if fmt == "summary":
+        typer.echo(to_summary(flowchart))
+    elif fmt == "mermaid":
+        typer.echo(to_mermaid(flowchart))
+    else:
+        raise typer.BadParameter(f"--format must be 'mermaid' or 'summary' (got {fmt!r}).")
+
+
 def _load_compiled_flowchart(build_dir: Path) -> Flowchart:
     """Load and graph-validate the compiled ``flowchart.json`` from a build dir."""
     ir_path = build_dir / "flowchart.json"
@@ -286,14 +370,16 @@ def generate(
     build_dir: Annotated[
         Path, typer.Argument(help="Build directory holding the compiled flowchart.json.")
     ],
-    n: Annotated[int, typer.Option("--n", help="Number of conversations to generate.")] = 100,
+    n: Annotated[
+        int, typer.Option("--n", min=1, help="Number of conversations to generate.")
+    ] = 100,
     model: Annotated[str, typer.Option("--model", help="Anthropic model id.")] = DEFAULT_MODEL,
     budget: Annotated[
         float, typer.Option("--budget", help="Hard USD spending cap; generation stops if hit.")
     ] = 50.0,
     seed: Annotated[int, typer.Option("--seed", help="Base RNG seed for reproducibility.")] = 0,
     max_concurrent: Annotated[
-        int, typer.Option("--max-concurrent", help="Maximum in-flight API calls.")
+        int, typer.Option("--max-concurrent", min=1, help="Maximum in-flight API calls.")
     ] = 10,
     yes: Annotated[
         bool,
@@ -483,7 +569,7 @@ def eval(
             "Note: the 'langgraph' baseline needs the [langgraph] extra.",
         ),
     ] = "in_context",
-    n: Annotated[int, typer.Option("--n", help="Scenarios per condition.")] = 200,
+    n: Annotated[int, typer.Option("--n", min=1, help="Scenarios per condition.")] = 200,
     judge_model: Annotated[
         str, typer.Option("--judge-model", help="Anthropic model id for the LLM judge.")
     ] = DEFAULT_MODEL,
@@ -500,7 +586,7 @@ def eval(
     ] = None,
     seed: Annotated[int, typer.Option("--seed", help="Base RNG seed.")] = 0,
     max_concurrent: Annotated[
-        int, typer.Option("--max-concurrent", help="Concurrent scenario evaluations.")
+        int, typer.Option("--max-concurrent", min=1, help="Concurrent scenario evaluations.")
     ] = 10,
     yes: Annotated[
         bool,

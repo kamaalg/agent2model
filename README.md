@@ -9,7 +9,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/kamaalg/agent2model/blob/main/LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#what-v1-ships)
 
-*Point `agent2model` at an agent procedure (a LangGraph graph, or a YAML flowchart) and it bakes the whole procedure into a small model's **weights** — so the model self-orchestrates with no runtime orchestrator and no per-turn frontier calls. The method reports **near-frontier quality at 128–462× lower inference cost** ([Dennis et al. 2026](https://arxiv.org/abs/2605.22502)); those are the paper's figures, not yet independently reproduced in this repo — see [Benchmarks](#benchmarks).*
+*Point `agent2model` at an agent procedure (a LangGraph graph, or a YAML flowchart) and it bakes the whole procedure into a small open model's **weights** — so at runtime the model self-orchestrates **privately, offline, with no orchestrator and no per-turn frontier calls.** The method ([Dennis et al. 2026](https://arxiv.org/abs/2605.22502)) reports near-frontier quality at **128–462× lower inference cost**; those are the paper's figures, **not yet reproduced here**. What this repo ships today is the open pipeline **and an eval harness that measures whether a compiled model actually follows the procedure** — see [Benchmarks](#benchmarks).*
 
 </div>
 
@@ -122,6 +122,63 @@ Prefer to author from scratch, or have no existing graph? Write the
 
 ---
 
+## See what you compiled
+
+`compile` writes a Mermaid diagram next to the IR, and `agent2model show <build>`
+prints it on demand — so you can *eyeball the exact procedure* that's about to be
+baked into the weights (free, offline, no API key). Here's the bundled
+travel-booking example, rendered straight from the compiled IR:
+
+```mermaid
+flowchart TD
+    greet["greet"]
+    gather_preferences["gather_preferences"]
+    assess_readiness{"assess_readiness"}
+    present_options["present_options"]
+    handle_response("handle_response")
+    evaluate_response{"evaluate_response"}
+    refine_options["refine_options"]
+    abandon_check{"abandon_check"}
+    book["book"]
+    confirm["confirm"]
+    escalate_to_human["escalate_to_human"]
+    booking_confirmed(["booking_confirmed"])
+    abandoned(["abandoned"])
+    escalated(["escalated"])
+
+    greet --> gather_preferences
+    gather_preferences --> assess_readiness
+    assess_readiness -->|"user has provided destination, dates, budget, a…"| present_options
+    assess_readiness -->|"one or more required details are still missing"| gather_preferences
+    present_options --> handle_response
+    handle_response --> evaluate_response
+    evaluate_response -->|"the customer clearly chose one of the options"| book
+    evaluate_response -->|"the customer wants different or adjusted options"| refine_options
+    evaluate_response -->|"the customer is hesitant, stalling, or unhappy"| abandon_check
+    refine_options --> present_options
+    abandon_check -->|"the customer wants to keep going with changes"| gather_preferences
+    abandon_check -->|"the customer is frustrated and wants a human"| escalate_to_human
+    abandon_check -->|"the customer disengages or declines to continue"| abandoned
+    book --> confirm
+    confirm --> booking_confirmed
+    escalate_to_human --> escalated
+
+    classDef start fill:#cce5ff,stroke:#004085,color:#004085;
+    classDef success fill:#d4edda,stroke:#28a745,color:#155724;
+    classDef abandon fill:#f8d7da,stroke:#dc3545,color:#721c24;
+    classDef escalate fill:#fff3cd,stroke:#ffc107,color:#856404;
+    class greet start;
+    class booking_confirmed success;
+    class abandoned abandon;
+    class escalated escalate;
+```
+
+Diamonds are `decision` nodes (resolved only at generation time), rounded boxes are
+`user` turns, and terminals are coloured by outcome. `agent2model show <build> --format
+summary` prints node/path counts instead.
+
+---
+
 ## Results from the paper (Dennis et al. 2026)
 
 > These are the **paper's** published targets, reproduced here as the benchmark we
@@ -213,6 +270,7 @@ agent2model compile my_graph.py --out build/mine
 ```
 build/travel/
 ├── flowchart.json          # canonical IR
+├── flowchart.mmd           # Mermaid diagram of the procedure (`agent2model show`)
 ├── dataset.jsonl           # n synthetic conversations (HF chat-template)
 ├── cost.json               # Anthropic token + USD ledger
 ├── generation_state.json   # checkpoint — resumes on rerun
@@ -334,8 +392,12 @@ multi-turn procedure.** The eval harness is a standalone, reproducible benchmark
 - **proper statistics**: bootstrap 95% CIs (10k resamples), Wilcoxon/Mann-Whitney,
   Holm-Bonferroni correction, failure rates, and cost-per-conversation.
 
-No competing agent or distillation tool ships procedure-adherence evaluation — they
-benchmark QA/math/tool tasks. Run the whole thing in one command:
+Fixed benchmarks for procedure adherence are emerging (τ²-bench, JourneyBench/UJCS)
+and observability tools now market "trajectory testing" — but those are either fixed
+domains or tool-call-sequence loggers. We're not aware of another **open, reusable**
+harness you point at *your own* flowchart: a flowchart-blind conversational user
+simulator + 5-criterion rubric + bootstrap CIs and nonparametric stats. Run the whole
+thing in one command:
 
 ```bash
 agent2model eval build/travel --baselines in_context,langgraph,same_model_orch --n 200
@@ -370,8 +432,9 @@ Build locally: `pip install -e ".[docs]" && mkdocs serve`.
 - ✅ **All 8 phases complete** — IR, generation, LangGraph adapter, training, serving, eval, cloud, examples/docs/release
 - ✅ **Unit tests passing**, `ruff` / `black` / `mypy --strict` clean
 - ✅ **Verified end-to-end** — `compile`, `generate` (real Anthropic), `eval` (real harness with judge + simulator + baseline + stats + PDF); 3B training verified on Modal
+- ✅ **Published on PyPI** — `pip install agent2model` (v0.1.0, alpha)
 - ⏳ **vLLM serving** — container-verified (model loads, OpenAI routes register); HTTP end-to-end pending
-- ⏳ **PyPI publish** — pending first paper-faithful reproduction
+- ⏳ **Paper reproduction** — the three `reproduce_*` entrypoints are wired and ready; own-name benchmark numbers are still being filled in (see [`benchmarks/`](https://github.com/kamaalg/agent2model/tree/main/benchmarks))
 
 ### What v1 ships
 
