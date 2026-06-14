@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 430" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="Diagram contrasting the old way (an orchestrator re-sends the whole procedure to a frontier model every turn) with agent2model (the procedure is compiled into a small model's weights, so it self-orchestrates with no per-turn frontier calls).">
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#6e7681"/>
+    </marker>
+    <marker id="arrowbig" markerWidth="10" markerHeight="10" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+
+  <!-- card -->
+  <rect x="1" y="1" width="1198" height="428" rx="14" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+
+  <!-- panel headers -->
+  <text x="290" y="42" text-anchor="middle" fill="#8b949e" font-size="17" font-weight="600" letter-spacing="0.5">THE OLD WAY — orchestrate live, every turn</text>
+  <text x="910" y="42" text-anchor="middle" fill="#3fb950" font-size="17" font-weight="700" letter-spacing="0.5">WITH agent2model — compiled into the weights</text>
+
+  <!-- ===================== LEFT (old way) ===================== -->
+  <!-- box 1: user message -->
+  <rect x="150" y="64" width="280" height="42" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="290" y="91" text-anchor="middle" fill="#e6edf3" font-size="16">User message</text>
+  <line x1="290" y1="106" x2="290" y2="132" stroke="#6e7681" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- box 2: orchestrator -->
+  <rect x="120" y="134" width="340" height="64" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="290" y="160" text-anchor="middle" fill="#e6edf3" font-size="16" font-weight="600">LangGraph / CrewAI orchestrator</text>
+  <text x="290" y="182" text-anchor="middle" fill="#8b949e" font-size="13.5">re-sends the whole procedure every turn</text>
+  <line x1="290" y1="198" x2="290" y2="224" stroke="#6e7681" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- box 3: frontier model -->
+  <rect x="120" y="226" width="340" height="64" rx="8" fill="#161b22" stroke="#f85149" stroke-width="1.8"/>
+  <text x="290" y="252" text-anchor="middle" fill="#e6edf3" font-size="16" font-weight="600">Frontier model (Sonnet / GPT-4)</text>
+  <text x="290" y="274" text-anchor="middle" fill="#f85149" font-size="13.5" font-weight="600">≈ $0.13 / turn · your data leaves the box</text>
+  <line x1="290" y1="290" x2="290" y2="316" stroke="#6e7681" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- box 4: reply -->
+  <rect x="150" y="318" width="280" height="42" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="290" y="345" text-anchor="middle" fill="#e6edf3" font-size="16">Agent reply</text>
+
+  <text x="290" y="392" text-anchor="middle" fill="#8b949e" font-size="13">pay per turn · procedure re-sent · cloud round-trip</text>
+
+  <!-- ===================== CENTER (compile) ===================== -->
+  <line x1="475" y1="215" x2="725" y2="215" stroke="#58a6ff" stroke-width="2.5" marker-end="url(#arrowbig)"/>
+  <rect x="540" y="192" width="120" height="30" rx="15" fill="#0d1117" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="600" y="212" text-anchor="middle" fill="#58a6ff" font-size="15" font-weight="700">compile</text>
+  <text x="600" y="246" text-anchor="middle" fill="#8b949e" font-size="12.5">train once,</text>
+  <text x="600" y="263" text-anchor="middle" fill="#8b949e" font-size="12.5">run forever</text>
+
+  <!-- ===================== RIGHT (agent2model) ===================== -->
+  <!-- box 1: user message -->
+  <rect x="770" y="64" width="280" height="42" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="910" y="91" text-anchor="middle" fill="#e6edf3" font-size="16">User message</text>
+  <line x1="910" y1="106" x2="910" y2="150" stroke="#6e7681" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- box 2: compiled model (taller — this is the whole runtime) -->
+  <rect x="740" y="152" width="340" height="138" rx="8" fill="#0f2417" stroke="#3fb950" stroke-width="1.8"/>
+  <text x="910" y="184" text-anchor="middle" fill="#e6edf3" font-size="16" font-weight="700">Compiled small model (Qwen 3B/8B)</text>
+  <text x="910" y="208" text-anchor="middle" fill="#8b949e" font-size="13.5">the procedure is baked into the weights</text>
+  <text x="910" y="236" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">no orchestrator · no per-turn frontier call</text>
+  <text x="910" y="262" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">≈ $0.001 / turn · private · offline</text>
+  <line x1="910" y1="290" x2="910" y2="316" stroke="#6e7681" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- box 3: reply -->
+  <rect x="770" y="318" width="280" height="42" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="910" y="345" text-anchor="middle" fill="#e6edf3" font-size="16">Agent reply</text>
+
+  <text x="910" y="392" text-anchor="middle" fill="#8b949e" font-size="13">~100× cheaper inference per the paper · reproduction in progress</text>
+</svg>
