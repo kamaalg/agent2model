@@ -12,7 +12,8 @@ factory).
 ## Compile it
 
 ```bash
-agent2model compile examples/langgraph_demo/demo.py --out build/demo
+agent2model init langgraph_demo                       # copy it out of the package
+agent2model compile langgraph_demo/demo.py --out build/demo
 ```
 
 This writes `build/demo/flowchart.json`. The adapter maps:
