@@ -32,8 +32,11 @@ The four commands (paper setup: Qwen 2.5 3B Instruct, ~2,125 conversations,
 20 epochs, ~3.5 h on one consumer GPU):
 
 ```bash
+# 0. Copy this example out of the installed package into your working dir.
+agent2model init travel_booking
+
 # 1. Compile + validate the flowchart into the IR.
-agent2model compile examples/travel_booking/flowchart.yaml --out build/travel
+agent2model compile travel_booking/flowchart.yaml --out build/travel
 
 # 2. Generate synthetic training data (resumable, budgeted, prompt-cached).
 agent2model generate build/travel --n 2000 --model claude-sonnet-4-5 --budget 60
