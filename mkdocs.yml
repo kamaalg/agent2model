@@ -1,5 +1,6 @@
 site_name: agent2model
-site_description: Turn your LangGraph agent into a small model that runs with no orchestrator — near-frontier quality at a fraction of the inference cost.
+site_description: Compile a stable LangGraph/YAML agent into a small model that self-orchestrates with no runtime orchestrator — private, offline, far cheaper inference.
+site_url: https://kamaalg.github.io/agent2model/
 repo_url: https://github.com/kamaalg/agent2model
 repo_name: kamaalg/agent2model
 docs_dir: docs
@@ -40,6 +41,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Quickstart: quickstart.md
+  - How it compares: comparison.md
   - IR spec reference: ir-spec.md
   - LangGraph adapter: adapters.md
   - Training guide: training.md

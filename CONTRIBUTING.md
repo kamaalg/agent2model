@@ -3,6 +3,30 @@
 Thanks for your interest in `agent2model`. This guide covers the conventions CI
 enforces and the release process.
 
+## Ways to contribute
+
+- **New examples** — a small `flowchart.yaml` + README for a procedure (it must pass
+  `agent2model compile` and `agent2model show`). No API key or GPU needed — the easiest
+  first PR.
+- **Docs, troubleshooting, FAQ** — if something tripped you up, fix the doc.
+- **Bug fixes** — see the open [good first issues](https://github.com/kamaalg/agent2model/issues).
+
+### Adapters wanted
+
+The biggest force-multiplier is **new framework adapters** — each one lets a whole
+ecosystem compile their existing agents with zero YAML. The LangGraph adapter
+(`src/agent2model/adapters/langgraph.py`) is the worked reference; an adapter recovers a
+framework's procedure *structure* (nodes, edges, decision branches, terminals) into the
+Flowchart IR and emits honest lossy-conversion warnings. On the wishlist:
+
+- **CrewAI Flows** → IR ([#5](https://github.com/kamaalg/agent2model/issues/5))
+- **OpenAI Agents SDK** → IR ([#6](https://github.com/kamaalg/agent2model/issues/6))
+- Anything else with a declared graph/flow (LlamaIndex Workflows, Pydantic AI, …)
+
+Open an issue first to align on the IR mapping, then mirror the LangGraph adapter's
+shape (structure recovery + `TODO:` prompt placeholders + warnings). See
+[`docs/adapters.md`](https://github.com/kamaalg/agent2model/blob/main/docs/adapters.md).
+
 ## Development setup
 
 ```bash
