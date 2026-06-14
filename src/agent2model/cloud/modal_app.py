@@ -71,7 +71,11 @@ from agent2model.cloud.modal_app_constants import (
     MODEL_ROOT,
     MODEL_VOLUME,
     SERVE_APP,
+    SERVE_EVAL_IMAGE,
+    SERVE_GPU,
     SERVE_IMAGE,
+    SERVE_PORT,
+    SERVE_TIMEOUT,
     TRAIN_3B_TIMEOUT,
     TRAIN_8B_TIMEOUT,
     TRAIN_IMAGE,
@@ -331,6 +335,32 @@ def evaluate(
     Returns:
         The serialised :class:`~agent2model.eval.runner.EvalRunResult`.
     """
+    _ = model_path  # accepted for pipeline symmetry; eval consumes served_url
+    return _run_eval_core(
+        recipe,
+        baselines=baselines,
+        served_url=served_url,
+        judge_model=judge_model,
+        seed=seed,
+        max_concurrent=max_concurrent,
+    )
+
+
+def _run_eval_core(
+    recipe: Recipe,
+    *,
+    baselines: tuple[str, ...],
+    served_url: str | None,
+    judge_model: str | None,
+    seed: int,
+    max_concurrent: int,
+) -> dict[str, Any]:
+    """Shared worker-side eval body: build conditions, run the harness, write reports.
+
+    Factored out of :func:`evaluate` so the GPU-backed :func:`evaluate_compiled`
+    reuses the exact same harness/report path. When ``served_url`` is set the
+    ``compiled`` condition is appended.
+    """
     import asyncio
 
     from agent2model.eval.baselines import make_condition
@@ -342,7 +372,6 @@ def evaluate(
     from agent2model.ir.loader import load_flowchart_from_string
     from agent2model.logging import logger
 
-    _ = model_path  # accepted for pipeline symmetry; eval consumes served_url
     build = _materialise_flowchart(recipe)
     flowchart = load_flowchart_from_string(recipe.flowchart_yaml)
 
@@ -368,8 +397,88 @@ def evaluate(
     except EvalError as exc:  # pragma: no cover - report extra optional on Modal
         logger.warning(str(exc))
     BUILD_VOLUME.commit()
-    logger.info(f"Evaluated {recipe.name}: total cost ${result.total_cost_usd:.4f}.")
+    logger.info(
+        f"Evaluated {recipe.name} ({', '.join(names)}): total cost ${result.total_cost_usd:.4f}."
+    )
     return result.model_dump(mode="json")
+
+
+@app.function(  # type: ignore[untyped-decorator]  # modal decorators are Any (see overrides)
+    image=SERVE_EVAL_IMAGE,
+    gpu=SERVE_GPU,
+    volumes=_VOLUMES,
+    secrets=[ANTHROPIC_SECRET],
+    timeout=EVALUATE_TIMEOUT,
+)
+def evaluate_compiled(
+    recipe: Recipe,
+    model_path: str | None = None,
+    *,
+    baselines: tuple[str, ...] = ("in_context", "langgraph"),
+    judge_model: str | None = None,
+    seed: int = 0,
+    max_concurrent: int = 10,
+) -> dict[str, Any]:
+    """Serve the compiled model locally and score it against baselines, in one GPU box.
+
+    This is what makes a one-command reproduction actually produce the
+    *compiled*-vs-baseline numbers (the whole point). It starts vLLM on localhost,
+    waits for readiness, runs the eval harness with the ``compiled`` condition
+    pointed at the local server plus the API baselines, then tears the server down.
+
+    ``same_model_orch`` is intentionally excluded: it would need the *base* model
+    served on a second endpoint (``make_condition`` otherwise routes it to the
+    Anthropic client with a non-Anthropic model id). The default baselines are the
+    in-context upper bound and the LangGraph industry orchestrator — the two
+    paper-relevant comparisons that run end-to-end here.
+
+    Args:
+        recipe: The recipe whose trained model to serve and score.
+        model_path: Optional explicit checkpoint path; defaults to the recipe's
+            on-volume model directory.
+        baselines: Baseline condition names (``compiled`` is always added).
+        judge_model: Anthropic judge model id (defaults to the harness default).
+        seed: Base RNG seed.
+        max_concurrent: Concurrent scenario evaluations.
+
+    Returns:
+        The serialised :class:`~agent2model.eval.runner.EvalRunResult`, now
+        including the ``compiled`` condition.
+    """
+    from agent2model.exceptions import ServingError
+    from agent2model.logging import logger
+    from agent2model.serve import vllm_server
+
+    base = model_path or _model_dir(recipe.name)
+    resolved = vllm_server.resolve_model_path(base)
+    base_url = f"http://127.0.0.1:{SERVE_PORT}/v1"
+
+    # Serve under the id the CompiledCondition requests ("compiled"), so vLLM's
+    # OpenAI server accepts the model name the harness sends.
+    proc = vllm_server.serve_background(
+        resolved, port=SERVE_PORT, host="127.0.0.1", served_model_name="compiled"
+    )
+    try:
+        logger.info(f"Waiting for the local vLLM server at {base_url} (up to {SERVE_TIMEOUT}s)…")
+        if not vllm_server.wait_until_ready(base_url, timeout=float(SERVE_TIMEOUT)):
+            raise ServingError(
+                f"The local vLLM server did not become ready at {base_url} within "
+                f"{SERVE_TIMEOUT}s; cannot score the compiled condition."
+            )
+        return _run_eval_core(
+            recipe,
+            baselines=tuple(baselines),
+            served_url=base_url,
+            judge_model=judge_model,
+            seed=seed,
+            max_concurrent=max_concurrent,
+        )
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except Exception:  # pragma: no cover - best-effort teardown
+            proc.kill()
 
 
 class _ServeProxy:
@@ -615,10 +724,13 @@ def _reproduce(recipe: Recipe, *, yes: bool = False) -> dict[str, Any]:
     dataset = generate_data.remote(recipe)
     trainer = train_3b if recipe.size == "3b" else train_8b
     model = trainer.remote(recipe, dataset)
-    return evaluate.remote(  # type: ignore[no-any-return]
+    # Serve the freshly trained model and score it against the baselines in one GPU
+    # container, so the report actually contains the compiled-vs-baseline numbers
+    # (the cost ratio + quality the reproduction is meant to demonstrate).
+    return evaluate_compiled.remote(  # type: ignore[no-any-return]
         recipe,
         model,
-        baselines=("in_context",),
+        baselines=("in_context", "langgraph"),
     )
 
 
