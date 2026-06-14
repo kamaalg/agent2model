@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the software and the paper it implements."
+title: "agent2model"
+abstract: >-
+  Compile a stable LangGraph/YAML agent procedure into a small open model's
+  weights so it self-orchestrates with no runtime orchestrator, plus a
+  procedure-adherence evaluation harness. An open implementation of Dennis et
+  al. 2026 (arXiv:2605.22502).
+type: software
+authors:
+  - given-names: Kamal
+    family-names: Gurbanov
+    email: kamalgurbanov916@gmail.com
+repository-code: "https://github.com/kamaalg/agent2model"
+url: "https://github.com/kamaalg/agent2model"
+license: Apache-2.0
+version: 0.1.0
+date-released: "2026-05-30"
+keywords:
+  - llm
+  - agents
+  - fine-tuning
+  - langgraph
+  - qwen
+  - distillation
+  - llmops
+  - agent-evaluation
+references:
+  - type: article
+    title: "Compiling Agentic Workflows into LLM Weights: Near-Frontier Quality at Two Orders of Magnitude Less Cost"
+    authors:
+      - family-names: Dennis
+        given-names: Simon
+    year: 2026
+    notes: "arXiv:2605.22502 — the method agent2model implements."
+    url: "https://arxiv.org/abs/2605.22502"

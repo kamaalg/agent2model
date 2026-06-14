@@ -1,0 +1,29 @@
+# agent2model
+
+> Compile a stable LangGraph/YAML agent procedure into a small open model's weights, so it self-orchestrates at runtime with no orchestrator and no per-turn frontier calls — private, offline, and cheap. Open implementation of Dennis et al. 2026 (arXiv:2605.22502).
+
+agent2model takes an agent procedure — a YAML flowchart, or imported directly from a LangGraph `StateGraph` — has Claude generate thousands of synthetic conversations through every path, and full-fine-tunes a small model (Qwen 2.5 3B / Qwen3 8B) on them. The procedure ends up in the weights, so at runtime there is no external orchestrator and no per-turn frontier-model calls.
+
+The paper reports near-frontier quality at 128–462× lower inference cost; those are the paper's figures and have NOT yet been reproduced in this repository (reproduction is in progress — see benchmarks/). What this project ships today is the open pipeline plus a procedure-adherence evaluation harness (a flowchart-blind user simulator, a 5-criterion LLM judge, baselines, bootstrap CIs, and Wilcoxon/Holm-Bonferroni statistics) that measures whether a model actually follows a multi-turn procedure. Apache-2.0.
+
+## Commands
+- `agent2model init <example>`: copy a bundled example into the working dir (free, offline)
+- `agent2model compile <src> --out <dir>`: validate a YAML/LangGraph procedure into the IR + a Mermaid diagram (free, offline)
+- `agent2model show <dir>`: render the compiled procedure as a Mermaid diagram or summary (free, offline)
+- `agent2model generate <dir>`: synthesize training conversations via Claude (`--mock` for a free offline preview)
+- `agent2model train <dir>`: full fine-tune Qwen 3B/8B (needs a GPU)
+- `agent2model eval <dir>`: score the compiled model vs baselines with the rubric (`--demo` renders an illustrative report offline)
+- `agent2model serve <dir>`: OpenAI-compatible vLLM endpoint
+
+## Docs
+- [README](https://github.com/kamaalg/agent2model/blob/main/README.md): overview, pipeline, the Flowchart IR, benchmarks framing
+- [Quickstart](https://github.com/kamaalg/agent2model/blob/main/docs/quickstart.md): first 10 minutes end-to-end
+- [IR spec](https://github.com/kamaalg/agent2model/blob/main/docs/ir-spec.md): every field of the flowchart YAML
+- [LangGraph adapter](https://github.com/kamaalg/agent2model/blob/main/docs/adapters.md): compile from a StateGraph
+- [Evaluation guide](https://github.com/kamaalg/agent2model/blob/main/docs/evaluation.md): the 5-criterion rubric, baselines, statistics
+- [Cloud deployment](https://github.com/kamaalg/agent2model/blob/main/docs/cloud.md): Modal recipes + RunPod templates
+
+## Reference
+- Paper: Dennis et al. 2026, "Compiling Agentic Workflows into LLM Weights" (https://arxiv.org/abs/2605.22502)
+- PyPI: https://pypi.org/project/agent2model/
+- License: Apache-2.0
