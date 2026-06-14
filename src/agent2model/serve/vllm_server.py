@@ -27,6 +27,12 @@ is pure Python and fully unit-tested without vLLM.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 from agent2model.exceptions import ServingError
@@ -35,8 +41,11 @@ from agent2model.logging import logger
 __all__ = [
     "BEST_SUBDIR",
     "build_vllm_server_args",
+    "build_vllm_server_command",
     "resolve_model_path",
     "serve",
+    "serve_background",
+    "wait_until_ready",
 ]
 
 BEST_SUBDIR = "best"
@@ -269,3 +278,118 @@ def _run_vllm_server(args: list[str]) -> None:  # pragma: no cover - GPU host on
     parser = make_arg_parser(FlexibleArgumentParser(description="agent2model vLLM OpenAI server"))
     parsed = parser.parse_args(args)
     asyncio.run(run_server(parsed))
+
+
+def build_vllm_server_command(
+    model_path: str | Path,
+    *,
+    port: int,
+    host: str,
+    served_model_name: str | None,
+    extra: list[str] | None = None,
+    python_executable: str | None = None,
+) -> list[str]:
+    """Build the full subprocess argv for launching vLLM out-of-process.
+
+    Wraps :func:`build_vllm_server_args` with the ``python -m
+    vllm.entrypoints.openai.api_server`` prefix so the server can be started as a
+    background subprocess (used by the in-pipeline reproduction eval, which serves
+    the compiled model locally and scores it without a separate deployment). Pure:
+    no I/O, no vLLM import, so it is unit-tested without a GPU.
+
+    Args:
+        model_path: Path to the loadable checkpoint directory.
+        port: TCP port to bind.
+        host: Interface to bind.
+        served_model_name: Public model id exposed via the API.
+        extra: Additional raw vLLM CLI args, appended unchanged.
+        python_executable: Python to invoke; defaults to the current interpreter.
+
+    Returns:
+        The full argv list, beginning with the Python executable.
+    """
+    args = build_vllm_server_args(
+        model_path, port=port, host=host, served_model_name=served_model_name, extra=extra
+    )
+    python = python_executable or sys.executable
+    return [python, "-m", "vllm.entrypoints.openai.api_server", *args]
+
+
+def serve_background(
+    model_path: str | Path,
+    *,
+    port: int = 8000,
+    host: str = "127.0.0.1",
+    served_model_name: str | None = None,
+    extra: list[str] | None = None,
+) -> subprocess.Popen[bytes]:
+    """Launch the vLLM OpenAI server as a background subprocess and return it.
+
+    Unlike :func:`serve` (which blocks), this starts vLLM out-of-process so the
+    caller can poll :func:`wait_until_ready`, drive the endpoint, then terminate
+    it. Used by the in-pipeline reproduction eval. Needs a GPU and the ``[serve]``
+    extra, so the launch itself runs only on a GPU host.
+
+    Args:
+        model_path: Path to a loadable checkpoint directory.
+        port: TCP port to bind. Defaults to ``8000``.
+        host: Interface to bind. Defaults to ``"127.0.0.1"`` (local only).
+        served_model_name: Public model id exposed via the API.
+        extra: Additional raw vLLM CLI args.
+
+    Returns:
+        The :class:`subprocess.Popen` handle for the running server.
+
+    Raises:
+        ServingError: If vLLM is not installed on this host.
+    """
+    _require_vllm()
+    cmd = build_vllm_server_command(
+        model_path, port=port, host=host, served_model_name=served_model_name, extra=extra
+    )
+    logger.info(f"Launching background vLLM server on http://{host}:{port}.")
+    return subprocess.Popen(cmd)
+
+
+def _probe_ready(base_url: str) -> bool:  # pragma: no cover - network/GPU host only
+    """Return True if the OpenAI-compatible server answers ``GET <base_url>/models``."""
+    url = base_url.rstrip("/") + "/models"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return bool(200 <= resp.status < 300)
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def wait_until_ready(
+    base_url: str,
+    *,
+    timeout: float = 600.0,
+    interval: float = 3.0,
+    probe: Callable[[str], bool] = _probe_ready,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Poll an OpenAI-compatible endpoint until it is ready or ``timeout`` elapses.
+
+    The probe/clock are injectable so the loop is unit-tested without a network or
+    GPU. Returns ``True`` as soon as ``probe(base_url)`` succeeds, else ``False``
+    after ``timeout`` seconds.
+
+    Args:
+        base_url: OpenAI-compatible base URL (e.g. ``http://127.0.0.1:8000/v1``).
+        timeout: Max seconds to wait.
+        interval: Seconds between probes.
+        probe: Readiness check; defaults to a ``GET /models`` request.
+        sleep: Sleep function (injectable for tests).
+        monotonic: Monotonic clock (injectable for tests).
+
+    Returns:
+        Whether the server became ready within ``timeout``.
+    """
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        if probe(base_url):
+            return True
+        sleep(interval)
+    return False

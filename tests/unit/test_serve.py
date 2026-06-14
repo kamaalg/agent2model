@@ -153,3 +153,76 @@ def test_module_imports_without_vllm() -> None:
     # Re-importing must not pull in vllm at module scope.
     mod = importlib.reload(vllm_server)
     assert hasattr(mod, "build_vllm_server_args")
+
+
+# --------------------------------------------------------------------------- #
+# background serve command + readiness poll
+# --------------------------------------------------------------------------- #
+
+
+def test_build_vllm_server_command_wraps_args() -> None:
+    cmd = vllm_server.build_vllm_server_command(
+        "build/travel/best",
+        port=8000,
+        host="127.0.0.1",
+        served_model_name="compiled",
+        python_executable="/usr/bin/python3",
+    )
+    assert cmd[:3] == ["/usr/bin/python3", "-m", "vllm.entrypoints.openai.api_server"]
+    assert cmd[3:] == [
+        "--model",
+        "build/travel/best",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+        "--served-model-name",
+        "compiled",
+    ]
+
+
+def test_wait_until_ready_returns_true_when_probe_succeeds() -> None:
+    calls = {"n": 0}
+
+    def probe(_url: str) -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 3  # ready on the third probe
+
+    clock = {"t": 0.0}
+
+    def monotonic() -> float:
+        return clock["t"]
+
+    def sleep(secs: float) -> None:
+        clock["t"] += secs
+
+    ready = vllm_server.wait_until_ready(
+        "http://127.0.0.1:8000/v1",
+        timeout=100.0,
+        interval=3.0,
+        probe=probe,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    assert ready is True
+    assert calls["n"] == 3
+
+
+def test_wait_until_ready_times_out() -> None:
+    clock = {"t": 0.0}
+
+    def monotonic() -> float:
+        return clock["t"]
+
+    def sleep(secs: float) -> None:
+        clock["t"] += secs
+
+    ready = vllm_server.wait_until_ready(
+        "http://127.0.0.1:8000/v1",
+        timeout=10.0,
+        interval=3.0,
+        probe=lambda _url: False,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    assert ready is False
