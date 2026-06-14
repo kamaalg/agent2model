@@ -31,8 +31,11 @@ Paper setup: Qwen3 8B, ~6,264 train conversations, 10 epochs. The 8B path uses
 DeepSpeed ZeRO-3 across 8 GPUs (run it on Modal unless you have that locally).
 
 ```bash
+# 0. Copy this example out of the installed package into your working dir.
+agent2model init zoom_support
+
 # 1. Compile + validate.
-agent2model compile examples/zoom_support/flowchart.yaml --out build/zoom
+agent2model compile zoom_support/flowchart.yaml --out build/zoom
 
 # 2. Generate synthetic data (medium volume, ~6k convos).
 agent2model generate build/zoom --n 6000 --model claude-sonnet-4-5 --budget 60

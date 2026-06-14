@@ -41,8 +41,11 @@ Paper setup: Qwen3 8B, ~3,000 conversations (2,700 train), 20 epochs. The 8B pat
 uses DeepSpeed ZeRO-3; run it on Modal unless you have an 8×A100 host.
 
 ```bash
+# 0. Copy this example out of the installed package into your working dir.
+agent2model init insurance_claims
+
 # 1. Compile + validate (this is the largest flowchart — worth eyeballing the node count).
-agent2model compile examples/insurance_claims/flowchart.yaml --out build/insurance
+agent2model compile insurance_claims/flowchart.yaml --out build/insurance
 
 # 2. Generate synthetic data (~3k convos cover the many branches).
 agent2model generate build/insurance --n 3000 --model claude-sonnet-4-5 --budget 60
