@@ -39,6 +39,15 @@ class GenerationBudgetExceeded(agent2modelError):
         )
 
 
+class StaleCheckpointError(agent2modelError):
+    """Raised when a generation checkpoint was produced from a different flowchart.
+
+    The checkpoint in ``generation_state.json`` is keyed by conversation index, so
+    resuming after the flowchart changed would silently mix conversations from two
+    procedures into one dataset. We refuse instead, with an actionable message.
+    """
+
+
 class TrainingDivergedError(agent2modelError):
     """Raised when fine-tuning diverges (NaN/Inf loss or runaway gradient)."""
 

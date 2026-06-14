@@ -365,6 +365,58 @@ def test_generator_run_writes_cost_and_dataset(sample_flowchart: Flowchart, tmp_
     assert written == 4
 
 
+def test_generate_mock_is_offline_and_deterministic(sample_flowchart: Flowchart) -> None:
+    from agent2model.generation.generator import generate_mock
+
+    cfg = GenerationConfig(n=5, budget_usd=1, seed=3)
+    a = generate_mock(sample_flowchart, cfg)
+    b = generate_mock(sample_flowchart, cfg)
+    assert len(a) == 5
+    # No API client touched; turns are templated placeholders.
+    assert all(t.content.startswith("[mock") for conv in a for t in conv.turns)
+    assert [t.content for t in a[0].turns] == [t.content for t in b[0].turns]
+
+
+def test_stale_checkpoint_refuses(sample_flowchart: Flowchart, tmp_path: Path) -> None:
+    import asyncio
+
+    from agent2model.exceptions import StaleCheckpointError
+    from agent2model.generation.generator import _flowchart_fingerprint, _save_checkpoint
+
+    # Write a checkpoint whose fingerprint belongs to a *different* flowchart.
+    state_path = tmp_path / "generation_state.json"
+    _save_checkpoint(
+        state_path, {"0": {"turns": []}}, CostTracker(model=DEFAULT_MODEL), "WRONGHASH"
+    )
+    assert _flowchart_fingerprint(sample_flowchart) != "WRONGHASH"
+
+    gen = ConversationGenerator(
+        sample_flowchart, GenerationConfig(n=3, budget_usd=1), client=_FakeClient()
+    )
+    with pytest.raises(StaleCheckpointError, match="different flowchart"):
+        asyncio.run(gen.run(tmp_path))
+
+
+def test_matching_checkpoint_resumes(sample_flowchart: Flowchart, tmp_path: Path) -> None:
+    import asyncio
+
+    from agent2model.generation.generator import _flowchart_fingerprint, _save_checkpoint
+
+    # A checkpoint with the *correct* fingerprint must resume, not refuse.
+    fp = _flowchart_fingerprint(sample_flowchart)
+    _save_checkpoint(
+        tmp_path / "generation_state.json",
+        {"0": {"turns": []}},
+        CostTracker(model=DEFAULT_MODEL),
+        fp,
+    )
+    gen = ConversationGenerator(
+        sample_flowchart, GenerationConfig(n=2, budget_usd=100), client=_FakeClient()
+    )
+    convos = asyncio.run(gen.run(tmp_path))
+    assert len(convos) == 2
+
+
 def test_budget_hard_stop(sample_flowchart: Flowchart, tmp_path: Path) -> None:
     # Each call costs a lot; budget is tiny -> must raise.
     client = _FakeClient(input_tokens=1_000_000, output_tokens=1_000_000)
