@@ -105,6 +105,12 @@ TRAIN_IMAGE = _install_image("train", gpu=True)
 #: Serving image: vLLM on CUDA devel (vLLM requires CUDA/Linux).
 SERVE_IMAGE = _install_image("serve", gpu=True)
 
+#: Combined serve + eval image: vLLM (to serve the compiled model locally) plus the
+#: eval extras (openai client, langgraph baseline, matplotlib report). Used by the
+#: in-pipeline reproduction eval that serves the compiled model and scores it against
+#: the baselines in one GPU container.
+SERVE_EVAL_IMAGE = _install_image("serve,eval", gpu=True)
+
 #: Persisted build artifacts (flowchart IR, dataset.jsonl, eval reports).
 BUILD_VOLUME = modal.Volume.from_name("agent2model-build", create_if_missing=True)
 #: Persisted fine-tuned model weights.
